@@ -24,7 +24,18 @@ Repository: [github.com/Win32Forth/ZForth](https://github.com/Win32Forth/ZForth)
 | **Kernel** | ARM64 assembly VM (`kernel.s`) + embedded `kernel.fth` / `ansfile.fth` |
 | **Resources** | Bundled `AutoLoad/`, `Library/`, and `Docs/` |
 
-Open the Xcode project (`ZForth.xcodeproj`) and run the **ZForth** scheme on Apple Silicon macOS.
+Open the Xcode project (`ZForthSTC.xcodeproj`) and run the **ZForthSTC** scheme on Apple Silicon macOS.
+
+### Agent channel (headless)
+
+For scripts / CI / tooling without the GUI:
+
+```bash
+./tools/zforthstc-agent -e '1 2 + .'
+./tools/zforthstc-agent -e 'STC : 1+ 1 + ; 5 1+ .'
+```
+
+See `ZForthSTC/Docs/Agent-channel.md`.
 
 ---
 

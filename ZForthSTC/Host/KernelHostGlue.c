@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 static volatile int g_running = 0;
 
@@ -126,3 +127,103 @@ void zforth_vm_stop(void)
     g_running = 0;
 }
 
+static int g_agent_started = 0;
+
+static void agent_install_hooks(void)
+{
+    kernel_set_emit(host_emit);
+    kernel_set_emit_buf(host_emit_buf);
+    kernel_set_load_file(host_load_file);
+    kernel_set_fromlib(zforth_fromlib_arm);
+    kernel_set_fromlib_clear(zforth_fromlib_clear);
+    kernel_set_chdir(zforth_chdir_hook);
+    kernel_set_pwd(zforth_pwd_hook);
+    kernel_set_dir(zforth_dir_hook);
+}
+
+int zforth_agent_start(void)
+{
+    if (g_agent_started)
+        return 0;
+    agent_install_hooks();
+    kernel_cold_start();
+    g_agent_started = 1;
+    return 0;
+}
+
+int zforth_agent_eval(const char *line, size_t n)
+{
+    int st;
+    if (!g_agent_started)
+        return -1;
+    if (!line)
+        return -1;
+    st = kernel_eval(line, n);
+    free_load_buf();
+    return st;
+}
+
+int zforth_agent_depth(void)
+{
+    return kernel_data_depth();
+}
+
+/* last_cfa holds pointer to the CFA cell of the latest word. */
+extern uint64_t last_cfa;
+
+/* Dump machine code at LAST's CFA (STC body). Returns 0 ok. */
+int zforth_agent_dump_tos_cfa(size_t n)
+{
+    uint64_t cfa;
+    uint64_t code;
+    char msg[80];
+    int len;
+
+    cfa = last_cfa;
+    if (cfa == 0)
+        return -1;
+    kernel_jit_write_begin();
+    code = *(uint64_t *)(uintptr_t)cfa;
+    len = snprintf(msg, sizeof(msg), "cfa=%llx code=%llx\n",
+                   (unsigned long long)cfa, (unsigned long long)code);
+    if (len > 0)
+        zforth_type(msg, (size_t)len);
+    if (code == 0)
+        return -2;
+    zforth_agent_hexdump((const void *)(uintptr_t)code, n ? n : 64);
+    return 0;
+}
+
+/* Debug: hex-dump n bytes at addr to host emit. */
+void zforth_agent_hexdump(const void *addr, size_t n)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    const unsigned char *p = (const unsigned char *)addr;
+    size_t i;
+    char buf[96];
+    size_t blen;
+
+    if (!addr || n == 0)
+        return;
+    kernel_jit_write_begin();
+    for (i = 0; i < n; i += 4) {
+        unsigned int w = 0;
+        size_t j;
+        for (j = 0; j < 4 && i + j < n; j++)
+            w |= (unsigned int)p[i + j] << (8 * j);
+        blen = 0;
+        buf[blen++] = hex[(w >> 28) & 0xF];
+        buf[blen++] = hex[(w >> 24) & 0xF];
+        buf[blen++] = hex[(w >> 20) & 0xF];
+        buf[blen++] = hex[(w >> 16) & 0xF];
+        buf[blen++] = hex[(w >> 12) & 0xF];
+        buf[blen++] = hex[(w >> 8) & 0xF];
+        buf[blen++] = hex[(w >> 4) & 0xF];
+        buf[blen++] = hex[w & 0xF];
+        buf[blen++] = ' ';
+        zforth_type(buf, blen);
+        if ((i & 15) == 12)
+            zforth_cr();
+    }
+    zforth_cr();
+}

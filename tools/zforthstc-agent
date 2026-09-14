@@ -1,0 +1,43 @@
+#!/bin/sh
+# zforthstc-agent — run ZForthSTC headless agent channel (load files, capture output).
+# Public domain.
+#
+# Usage:
+#   ./tools/zforthstc-agent -e '2 2 + .'
+#   ./tools/zforthstc-agent -e 'STC : 1+ 1 + ; 5 1+ .'
+#   ./tools/zforthstc-agent -c ~/Documents/XCodeProjects/ZForthSTC -f smoke.fth -o /tmp/out.txt
+#   ./tools/zforthstc-agent --help
+#
+# Resolves the app binary from (first hit):
+#   ZFORTHSTC_APP        — path to ZForthSTC.app or the MacOS/ZForthSTC binary
+#   /Applications/ZForthSTC.app
+#   DerivedData Debug build (if present)
+
+set -e
+
+resolve_bin() {
+  if [ -n "${ZFORTHSTC_APP:-}" ]; then
+    if [ -x "${ZFORTHSTC_APP}" ] && [ ! -d "${ZFORTHSTC_APP}" ]; then
+      echo "${ZFORTHSTC_APP}"
+      return
+    fi
+    if [ -x "${ZFORTHSTC_APP}/Contents/MacOS/ZForthSTC" ]; then
+      echo "${ZFORTHSTC_APP}/Contents/MacOS/ZForthSTC"
+      return
+    fi
+  fi
+  if [ -x "/Applications/ZForthSTC.app/Contents/MacOS/ZForthSTC" ]; then
+    echo "/Applications/ZForthSTC.app/Contents/MacOS/ZForthSTC"
+    return
+  fi
+  dd=$(ls -d "$HOME/Library/Developer/Xcode/DerivedData"/ZForthSTC-*/Build/Products/Debug/ZForthSTC.app/Contents/MacOS/ZForthSTC 2>/dev/null | head -1)
+  if [ -n "$dd" ] && [ -x "$dd" ]; then
+    echo "$dd"
+    return
+  fi
+  echo "zforthstc-agent: cannot find ZForthSTC binary. Build in Xcode, or set ZFORTHSTC_APP=…/ZForthSTC.app" >&2
+  exit 127
+}
+
+BIN=$(resolve_bin)
+exec "$BIN" --agent "$@"

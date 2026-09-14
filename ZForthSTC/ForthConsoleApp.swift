@@ -1,6 +1,5 @@
 import SwiftUI
 
-@main
 struct ForthConsoleApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
     @State private var session = ForthSession()

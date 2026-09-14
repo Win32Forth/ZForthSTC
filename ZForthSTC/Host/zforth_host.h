@@ -46,6 +46,13 @@ int32_t zforth_take_source(char *addr, int32_t maxcount);
 void zforth_vm_start(void);
 void zforth_vm_stop(void);
 
+/* Headless agent channel: cold start once, then kernel_eval without ACCEPT. */
+int zforth_agent_start(void);
+int zforth_agent_eval(const char *line, size_t n);
+int zforth_agent_depth(void);
+void zforth_agent_hexdump(const void *addr, size_t n);
+int zforth_agent_dump_tos_cfa(size_t n);
+
 #ifdef __cplusplus
 }
 #endif

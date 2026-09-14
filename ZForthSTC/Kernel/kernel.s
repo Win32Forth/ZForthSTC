@@ -149,6 +149,8 @@ dict_base:      .quad 0
 dict_limit:     .quad 0
 state_var:      .quad 0
 base_var:       .quad 10
+.globl _last_cfa
+_last_cfa:
 last_cfa:       .quad 0
 source_addr:    .quad 0
 source_len:     .quad 0
@@ -395,12 +397,20 @@ XOVER:
 BOOT_WORD "EMIT", "EMIT ( c -- )", 0, XEMIT, 333
 XEMIT:
     DPOP x0
-    stp  x19, x21, [sp, #-32]!
-    stp  x22, x23, [sp, #16]
+    // Must save x30: STC callers use blr/ret; bl _putchar would smash LR.
+    stp  x29, x30, [sp, #-48]!
+    stp  x19, x21, [sp, #16]
+    stp  x22, x23, [sp, #32]
     bl   _putchar
-    ldp  x22, x23, [sp, #16]
-    ldp  x19, x21, [sp], #32
+    ldp  x22, x23, [sp, #32]
+    ldp  x19, x21, [sp, #16]
+    ldp  x29, x30, [sp], #48
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "ABORT", "ABORT ( i*x -- ) empty stacks, then QUIT", 0, XABORT, 343
 XABORT:
@@ -593,6 +603,15 @@ XSEMI:
 
 BOOT_WORD "IF", "IF ( f -- )", FL_IMM, XIF, 486
 XIF:
+    adrp x0, stc_mode@page
+    add  x0, x0, stc_mode@pageoff
+    ldr  x0, [x0]
+    cbz  x0, L_if_itc
+    bl   _emit_dpop_x0
+    bl   _emit_cbz_x0_0
+    DPUSH x0
+    NEXT
+L_if_itc:
     adrp x0, cfa_0branch@page
     add  x0, x0, cfa_0branch@pageoff
     ldr  x0, [x0]
@@ -607,6 +626,17 @@ XIF:
 
 BOOT_WORD "THEN", "THEN ( addr -- )", FL_IMM, XTHEN, 500
 XTHEN:
+    adrp x0, stc_mode@page
+    add  x0, x0, stc_mode@pageoff
+    ldr  x0, [x0]
+    cbz  x0, L_then_itc
+    DPOP x0
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x1, [x1]
+    bl   _patch_br
+    NEXT
+L_then_itc:
     DPOP x1                         // hole
     adrp x0, here_ptr@page
     add  x0, x0, here_ptr@pageoff
@@ -617,6 +647,21 @@ XTHEN:
 
 BOOT_WORD "ELSE", "ELSE ( addr -- addr )", FL_IMM, XELSE, 510
 XELSE:
+    adrp x0, stc_mode@page
+    add  x0, x0, stc_mode@pageoff
+    ldr  x0, [x0]
+    cbz  x0, L_else_itc
+    bl   _emit_b0
+    str  x0, [sp, #-16]!            // new hole (skip else)
+    DPOP x0                         // IF cbz hole
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x1, [x1]
+    bl   _patch_br                  // false → else body
+    ldr  x0, [sp], #16
+    DPUSH x0
+    NEXT
+L_else_itc:
     adrp x0, cfa_branch@page
     add  x0, x0, cfa_branch@pageoff
     ldr  x0, [x0]
@@ -642,11 +687,25 @@ XBEGIN:
     adrp x0, here_ptr@page
     add  x0, x0, here_ptr@pageoff
     ldr  x0, [x0]
-    DPUSH x0
+    adrp x1, stc_mode@page
+    add  x1, x1, stc_mode@pageoff
+    ldr  x1, [x1]
+    cbz  x1, 1f
+    add  x0, x0, #3
+    and  x0, x0, #-4
+1:  DPUSH x0
     NEXT
 
 BOOT_WORD "AGAIN", "AGAIN ( addr -- )", FL_IMM, XAGAIN, 540
 XAGAIN:
+    adrp x0, stc_mode@page
+    add  x0, x0, stc_mode@pageoff
+    ldr  x0, [x0]
+    cbz  x0, L_again_itc
+    DPOP x0
+    bl   _compile_b_to
+    NEXT
+L_again_itc:
     DPOP x1                         // dest
     adrp x0, cfa_branch@page
     add  x0, x0, cfa_branch@pageoff
@@ -661,6 +720,17 @@ XAGAIN:
 
 BOOT_WORD "UNTIL", "UNTIL ( addr -- )", FL_IMM, XUNTIL, 554
 XUNTIL:
+    adrp x0, stc_mode@page
+    add  x0, x0, stc_mode@pageoff
+    ldr  x0, [x0]
+    cbz  x0, L_until_itc
+    DPOP x1                         // BEGIN dest
+    str  x1, [sp, #-16]!
+    bl   _emit_dpop_x0
+    ldr  x0, [sp], #16
+    bl   _compile_cbz_x0_to
+    NEXT
+L_until_itc:
     adrp x0, cfa_0branch@page
     add  x0, x0, cfa_0branch@pageoff
     ldr  x0, [x0]
@@ -675,6 +745,19 @@ XUNTIL:
 
 BOOT_WORD "WHILE", "WHILE ( orig -- orig hole ) leave if false", FL_IMM, XWHILE, 568
 XWHILE:
+    adrp x0, stc_mode@page
+    add  x0, x0, stc_mode@pageoff
+    ldr  x0, [x0]
+    cbz  x0, L_while_itc
+    bl   _emit_dpop_x0
+    bl   _emit_cbz_x0_0
+    DPUSH x0
+    ldr  x0, [x22]
+    ldr  x1, [x22, #8]
+    str  x1, [x22]
+    str  x0, [x22, #8]
+    NEXT
+L_while_itc:
     adrp x0, cfa_0branch@page
     add  x0, x0, cfa_0branch@pageoff
     ldr  x0, [x0]
@@ -693,6 +776,19 @@ XWHILE:
 
 BOOT_WORD "REPEAT", "REPEAT ( hole dest -- )", FL_IMM, XREPEAT, 586
 XREPEAT:
+    adrp x0, stc_mode@page
+    add  x0, x0, stc_mode@pageoff
+    ldr  x0, [x0]
+    cbz  x0, L_repeat_itc
+    DPOP x0                         // BEGIN dest
+    bl   _compile_b_to
+    DPOP x0                         // WHILE hole
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x1, [x1]
+    bl   _patch_br
+    NEXT
+L_repeat_itc:
     adrp x0, cfa_branch@page
     add  x0, x0, cfa_branch@pageoff
     ldr  x0, [x0]
@@ -1008,14 +1104,24 @@ XCFETCH:
     ldr  x0, [x22]
     ldrb w0, [x0]
     str  x0, [x22]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "C!", "C! ( c a -- )", 0, XCSTORE, 902
 XCSTORE:
     DPOP x1                     // a
     DPOP x0                     // c
     strb w0, [x1]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "AND", "AND ( n1 n2 -- n3 )", 0, XAND, 909
 XAND:
@@ -1023,7 +1129,12 @@ XAND:
     ldr  x1, [x22]
     and  x1, x1, x0
     str  x1, [x22]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "OR", "OR ( n1 n2 -- n3 )", 0, XORR, 917
 XORR:
@@ -1031,7 +1142,12 @@ XORR:
     ldr  x1, [x22]
     orr  x1, x1, x0
     str  x1, [x22]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "XOR", "XOR ( n1 n2 -- n3 )", 0, XXOR, 925
 XXOR:
@@ -1039,14 +1155,24 @@ XXOR:
     ldr  x1, [x22]
     eor  x1, x1, x0
     str  x1, [x22]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "INVERT", "INVERT ( n -- n' )", 0, XINVERT, 933
 XINVERT:
     ldr  x0, [x22]
     mvn  x0, x0
     str  x0, [x22]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "0=", "0= ( n -- f )", 0, XZEQ, 940
 XZEQ:
@@ -1054,7 +1180,12 @@ XZEQ:
     cmp  x0, #0
     csetm x0, eq
     str  x0, [x22]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "0<", "0< ( n -- f )", 0, XZLT, 948
 XZLT:
@@ -1062,7 +1193,12 @@ XZLT:
     cmp  x0, #0
     csetm x0, lt
     str  x0, [x22]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD "<", "< ( n1 n2 -- f )", 0, XLT, 956
 XLT:
@@ -1071,7 +1207,12 @@ XLT:
     cmp  x1, x0
     csetm x1, lt
     str  x1, [x22]
+    adrp x16, stc_running@page
+    add  x16, x16, stc_running@pageoff
+    ldr  x16, [x16]
+    cbnz x16, 1f
     NEXT
+1:  ret
 
 BOOT_WORD ">R", ">R ( n -- )", 0, XTOR, 965
 XTOR:
@@ -2859,6 +3000,105 @@ _compile_ret:
     movz x0, #0x03C0
     movk x0, #0xD65F, lsl #16           // ret
     b    _emit_u32
+
+// Emit: ldr x0, [x22], #8   (post-index writeback)
+_emit_dpop_x0:
+    movz x0, #0x86C0
+    movk x0, #0xF840, lsl #16      // 0xF84086C0
+    b    _emit_u32
+
+// Emit placeholder b #0; return insn address in x0.
+_emit_b0:
+    stp  x29, x30, [sp, #-32]!
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x2, [x1]
+    add  x2, x2, #3
+    and  x2, x2, #-4
+    str  x2, [sp, #16]
+    movz x0, #0x0000
+    movk x0, #0x1400, lsl #16
+    bl   _emit_u32
+    ldr  x0, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// Emit placeholder cbz x0, #0; return insn address in x0.
+_emit_cbz_x0_0:
+    stp  x29, x30, [sp, #-32]!
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x2, [x1]
+    add  x2, x2, #3
+    and  x2, x2, #-4
+    str  x2, [sp, #16]
+    movz x0, #0x0000
+    movk x0, #0xB400, lsl #16
+    bl   _emit_u32
+    ldr  x0, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// x0 = branch insn addr, x1 = target. Patches B or CBZ imm.
+_patch_br:
+    sub  x2, x1, x0
+    asr  x2, x2, #2
+    ldr  w3, [x0]
+    lsr  w4, w3, #26
+    cmp  w4, #5                     // B: 000101
+    b.ne 1f
+    and  w2, w2, #0x03FFFFFF
+    and  w3, w3, #0xFC000000
+    orr  w3, w3, w2
+    str  w3, [x0]
+    ret
+1:  and  w2, w2, #0x7FFFF           // CBZ imm19
+    lsl  w2, w2, #5
+    and  w3, w3, #0xFF00001F
+    orr  w3, w3, w2
+    str  w3, [x0]
+    ret
+
+// x0 = target. Emit b to target.
+_compile_b_to:
+    stp  x29, x30, [sp, #-32]!
+    str  x0, [sp, #16]
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x2, [x1]
+    add  x2, x2, #3
+    and  x2, x2, #-4
+    ldr  x3, [sp, #16]
+    sub  x2, x3, x2
+    asr  x2, x2, #2
+    and  x2, x2, #0x03FFFFFF
+    movz x0, #0x0000
+    movk x0, #0x1400, lsl #16
+    orr  x0, x0, x2
+    bl   _emit_u32
+    ldp  x29, x30, [sp], #32
+    ret
+
+// x0 = target. Emit cbz x0, target.
+_compile_cbz_x0_to:
+    stp  x29, x30, [sp, #-32]!
+    str  x0, [sp, #16]
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x2, [x1]
+    add  x2, x2, #3
+    and  x2, x2, #-4
+    ldr  x3, [sp, #16]
+    sub  x2, x3, x2
+    asr  x2, x2, #2
+    and  x2, x2, #0x7FFFF
+    lsl  x2, x2, #5
+    movz x0, #0x0000
+    movk x0, #0xB400, lsl #16
+    orr  x0, x0, x2
+    bl   _emit_u32
+    ldp  x29, x30, [sp], #32
+    ret
 
 _compile_lit:
     stp  x29, x30, [sp, #-32]!

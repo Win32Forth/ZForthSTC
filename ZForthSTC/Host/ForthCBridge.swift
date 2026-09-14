@@ -4,6 +4,11 @@ import Foundation
 enum ForthCBridge {
     static weak var session: ForthSession?
 
+    /// Headless agent: when set, EMIT/TYPE/CR go here instead of the GUI session.
+    static var agentSink: ((String) -> Void)?
+
+    static var isAgent: Bool { agentSink != nil }
+
     static func attach(_ session: ForthSession) {
         self.session = session
     }
@@ -14,6 +19,17 @@ enum ForthCBridge {
             fatalError("ForthCBridge.attach(_:) was not called")
         }
         return session
+    }
+
+    /// Console output for GUI or agent.
+    static func writeOut(_ text: String) {
+        if let agentSink {
+            agentSink(text)
+            return
+        }
+        onMainSync {
+            requireSession().writeConsole(text)
+        }
     }
 }
 
@@ -33,6 +49,14 @@ private final class Box<T> {
 
 @_cdecl("zforth_emit")
 public func zforth_emit(_ c: UInt8) {
+    if ForthCBridge.isAgent {
+        if c == 10 || c == 13 {
+            ForthCBridge.writeOut("\n")
+        } else if let scalar = UnicodeScalar(UInt32(c)) {
+            ForthCBridge.writeOut(String(Character(scalar)))
+        }
+        return
+    }
     onMainSync {
         ForthCBridge.requireSession().emit(c)
     }
@@ -47,6 +71,10 @@ public func zforth_type(_ addr: UnsafePointer<CChar>?, _ u: Int) {
         Character(UnicodeScalar(byte))
     })
 
+    if ForthCBridge.isAgent {
+        ForthCBridge.writeOut(string)
+        return
+    }
     onMainSync {
         ForthCBridge.requireSession().type(string)
     }
@@ -54,6 +82,10 @@ public func zforth_type(_ addr: UnsafePointer<CChar>?, _ u: Int) {
 
 @_cdecl("zforth_cr")
 public func zforth_cr() {
+    if ForthCBridge.isAgent {
+        ForthCBridge.writeOut("\n")
+        return
+    }
     onMainSync {
         ForthCBridge.requireSession().cr()
     }
@@ -61,6 +93,7 @@ public func zforth_cr() {
 
 @_cdecl("zforth_page")
 public func zforth_page() {
+    if ForthCBridge.isAgent { return }
     onMainSync {
         ForthCBridge.requireSession().page()
     }
@@ -68,6 +101,7 @@ public func zforth_page() {
 
 @_cdecl("zforth_refresh")
 public func zforth_refresh() {
+    if ForthCBridge.isAgent { return }
     onMainSync {
         ForthCBridge.requireSession().requestScreenRefresh()
     }
@@ -75,6 +109,9 @@ public func zforth_refresh() {
 
 @_cdecl("zforth_accept")
 public func zforth_accept(_ addr: UnsafeMutablePointer<CChar>?, _ maxcount: Int32) -> Int32 {
+    if ForthCBridge.isAgent {
+        return 0
+    }
     precondition(!Thread.isMainThread, "zforth_accept cannot run on the main thread")
     let maxN = max(0, Int(maxcount))
     let box = Box("")
@@ -96,6 +133,9 @@ public func zforth_accept(_ addr: UnsafeMutablePointer<CChar>?, _ maxcount: Int3
 
 @_cdecl("zforth_key")
 public func zforth_key() -> Int32 {
+    if ForthCBridge.isAgent {
+        return -1
+    }
     precondition(!Thread.isMainThread, "zforth_key cannot run on the main thread")
     let box = Box<UInt8>(0)
     let sem = DispatchSemaphore(value: 0)
@@ -112,6 +152,10 @@ public func zforth_key() -> Int32 {
 
 @_cdecl("zforth_fromlib_arm")
 public func zforth_fromlib_arm() {
+    if ForthCBridge.isAgent {
+        onMainSync { ForthCBridge.session?.armFromLib() }
+        return
+    }
     onMainSync {
         ForthCBridge.requireSession().armFromLib()
     }
@@ -119,6 +163,10 @@ public func zforth_fromlib_arm() {
 
 @_cdecl("zforth_edit_hook")
 public func zforth_edit_hook(_ path: UnsafePointer<CChar>?, _ n: Int) {
+    if ForthCBridge.isAgent {
+        ForthCBridge.writeOut("[ZForthSTC agent] EDIT ignored in agent mode\n")
+        return
+    }
     precondition(!Thread.isMainThread, "edit hook cannot run on main")
     let raw: String = {
         guard let path, n > 0 else { return "" }
@@ -139,11 +187,31 @@ public func zforth_edit_hook(_ path: UnsafePointer<CChar>?, _ n: Int) {
 
 @_cdecl("zforth_chdir_hook")
 public func zforth_chdir_hook(_ path: UnsafePointer<CChar>?, _ n: Int) {
-    precondition(!Thread.isMainThread)
     let raw: String = {
         guard let path, n > 0 else { return "" }
         return String(bytes: UnsafeRawBufferPointer(start: UnsafeRawPointer(path), count: n), encoding: .utf8) ?? ""
     }()
+    if ForthCBridge.isAgent {
+        onMainSync {
+            guard let session = ForthCBridge.session else { return }
+            if raw.isEmpty {
+                ForthCBridge.writeOut("[ZForthSTC agent] CHDIR bare ignored\n")
+                return
+            }
+            let url = raw.hasPrefix("/")
+                ? URL(fileURLWithPath: raw, isDirectory: true)
+                : session.cwd.appendingPathComponent(raw, isDirectory: true)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                session.cwd = url.standardizedFileURL
+                _ = FileManager.default.changeCurrentDirectoryPath(session.cwd.path)
+            } else {
+                ForthCBridge.writeOut("[ZForthSTC agent] can't chdir: \(url.path)\n")
+            }
+        }
+        return
+    }
+    precondition(!Thread.isMainThread)
     let sem = DispatchSemaphore(value: 0)
     DispatchQueue.main.async {
         Task { @MainActor in
@@ -157,6 +225,11 @@ public func zforth_chdir_hook(_ path: UnsafePointer<CChar>?, _ n: Int) {
 @_cdecl("zforth_pwd_hook")
 public func zforth_pwd_hook() {
     onMainSync {
+        if ForthCBridge.isAgent {
+            let path = ForthCBridge.session?.cwd.path ?? FileManager.default.currentDirectoryPath
+            ForthCBridge.writeOut(path + "\n")
+            return
+        }
         let session = ForthCBridge.requireSession()
         session.type(session.cwd.path)
         session.cr()
@@ -165,11 +238,32 @@ public func zforth_pwd_hook() {
 
 @_cdecl("zforth_dir_hook")
 public func zforth_dir_hook(_ path: UnsafePointer<CChar>?, _ n: Int) {
-    precondition(!Thread.isMainThread)
     let raw: String = {
         guard let path, n > 0 else { return "" }
         return String(bytes: UnsafeRawBufferPointer(start: UnsafeRawPointer(path), count: n), encoding: .utf8) ?? ""
     }()
+    if ForthCBridge.isAgent {
+        onMainSync {
+            guard let session = ForthCBridge.session else { return }
+            let url: URL
+            if raw.isEmpty {
+                url = session.fromLibArmed ? session.libraryURL : session.cwd
+                session.clearFromLib()
+            } else if raw.hasPrefix("/") {
+                url = URL(fileURLWithPath: raw, isDirectory: true)
+            } else {
+                url = session.cwd.appendingPathComponent(raw, isDirectory: true)
+            }
+            ForthCBridge.writeOut(url.path + "\n")
+            if let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) {
+                for name in names.sorted() where !name.hasPrefix(".") {
+                    ForthCBridge.writeOut(name + "\n")
+                }
+            }
+        }
+        return
+    }
+    precondition(!Thread.isMainThread)
     let sem = DispatchSemaphore(value: 0)
     DispatchQueue.main.async {
         Task { @MainActor in
@@ -183,12 +277,15 @@ public func zforth_dir_hook(_ path: UnsafePointer<CChar>?, _ n: Int) {
 @_cdecl("zforth_fromlib_clear")
 public func zforth_fromlib_clear() {
     onMainSync {
-        ForthCBridge.requireSession().clearFromLib()
+        ForthCBridge.session?.clearFromLib()
     }
 }
 
 @_cdecl("zforth_request_quit")
 public func zforth_request_quit() {
+    if ForthCBridge.isAgent {
+        Foundation.exit(0)
+    }
     DispatchQueue.main.async {
         NSApp.terminate(nil)
     }
@@ -201,15 +298,22 @@ public func zforth_get_load_base(
 ) -> Int32 {
     guard let out, maxcount > 0 else { return 0 }
     return onMainSync {
-        let session = ForthCBridge.requireSession()
-        let base = session.fromLibArmed ? session.libraryURL : session.cwd
-        session.clearFromLib()
-        return writePath(base.path, to: out, max: Int(maxcount))
+        if let session = ForthCBridge.session {
+            let base = session.fromLibArmed ? session.libraryURL : session.cwd
+            session.clearFromLib()
+            return writePath(base.path, to: out, max: Int(maxcount))
+        }
+        let cwd = FileManager.default.currentDirectoryPath
+        return writePath(cwd, to: out, max: Int(maxcount))
     }
 }
 
 @_cdecl("zforth_open_panel")
 public func zforth_open_panel(_ pathOut: UnsafeMutablePointer<CChar>?, _ maxcount: Int32) -> Int32 {
+    if ForthCBridge.isAgent {
+        ForthCBridge.writeOut("[ZForthSTC agent] open panel cancelled (agent mode)\n")
+        return 0
+    }
     precondition(!Thread.isMainThread, "zforth_open_panel cannot run on the main thread")
     let box = Box<URL?>(nil)
     let sem = DispatchSemaphore(value: 0)
@@ -233,6 +337,10 @@ public func zforth_save_panel(
     _ maxcount: Int32,
     _ suggested: UnsafePointer<CChar>?
 ) -> Int32 {
+    if ForthCBridge.isAgent {
+        ForthCBridge.writeOut("[ZForthSTC agent] save panel cancelled (agent mode)\n")
+        return 0
+    }
     precondition(!Thread.isMainThread, "zforth_save_panel cannot run on the main thread")
     let name = suggested.map { String(cString: $0) } ?? "Untitled.fth"
     let box = Box<URL?>(nil)
