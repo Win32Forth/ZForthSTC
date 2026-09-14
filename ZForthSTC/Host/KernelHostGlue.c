@@ -23,9 +23,10 @@ static void host_emit_buf(const char *buf, size_t n)
 
 static void free_load_buf(void)
 {
-    free(g_load_buf);
+    char *p = g_load_buf;
     g_load_buf = NULL;
     g_load_len = 0;
+    free(p);
 }
 
 static int host_load_file(const char *path, size_t path_len,

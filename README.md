@@ -32,8 +32,10 @@ For scripts / CI / tooling without the GUI:
 
 ```bash
 ./tools/zforthstc-agent -e '1 2 + .'
-./tools/zforthstc-agent -e 'STC : 1+ 1 + ; 5 1+ .'
+./tools/zforthstc-agent -e ': 1+ 1 + ; 5 1+ .'
 ```
+
+After boot blobs, new `:` definitions are STC by default (no need to type `STC`).
 
 See `ZForthSTC/Docs/Agent-channel.md`.
 

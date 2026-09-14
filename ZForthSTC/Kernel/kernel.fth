@@ -9,24 +9,7 @@ DOC" PAD ( -- addr ) scratch buffer"
 CREATE PAD 256 ALLOT
 
 \ --- Stack helpers ----------------------------------------------------------
-DOC" NIP ( x1 x2 -- x2 ) drop NOS"
-: NIP   SWAP DROP ;
-DOC" TUCK ( x1 x2 -- x2 x1 x2 ) copy TOS under NOS"
-: TUCK  SWAP OVER ;
-DOC" 2DUP ( x1 x2 -- x1 x2 x1 x2 ) duplicate pair"
-: 2DUP  OVER OVER ;
-DOC" 2DROP ( x1 x2 -- ) drop two cells"
-: 2DROP DROP DROP ;
-DOC" ROT ( x1 x2 x3 -- x2 x3 x1 ) rotate top three"
-: ROT   >R SWAP R> SWAP ;
-DOC" 1+ ( n -- n+1 )"
-: 1+    1 + ;
-DOC" 1- ( n -- n-1 )"
-: 1-    1 - ;
-DOC" NEGATE ( n -- -n )"
-: NEGATE  0 SWAP - ;
-DOC" 2SWAP ( x1 x2 x3 x4 -- x3 x4 x1 x2 ) swap cell pairs"
-: 2SWAP  ROT >R ROT R> ;
+\ NIP TUCK 2DUP 2DROP ROT 2SWAP 1+ 1- NEGATE are CODE (STC dual-tail).
 DOC" 2>R ( x1 x2 -- ) ( R: -- x1 x2 ) move pair to return stack"
 : 2>R  SWAP >R >R ;
 DOC" 2R> ( -- x1 x2 ) ( R: x1 x2 -- ) restore pair from return stack"
@@ -58,71 +41,30 @@ DOC" CELL ( -- n ) address units per cell"
 DOC" BL ( -- c ) space character"
 32 CONSTANT BL
 
-DOC" CELL+ ( a-addr -- a-addr' ) add one cell"
-: CELL+ CELL + ;
-DOC" CELLS ( n1 -- n2 ) cells to address units"
-: CELLS CELL * ;
-
-\ --- Logic (built on CODE 0= 0< < AND INVERT) -------------------------------
-DOC" = ( n1 n2 -- flag ) equal"
-: =    - 0= ;
-DOC" <> ( n1 n2 -- flag ) not equal"
-: <>   = INVERT ;
-DOC" > ( n1 n2 -- flag ) greater than"
-: >    SWAP < ;
-DOC" 0<> ( n -- flag ) not equal to zero"
-: 0<>  0= INVERT ;
+\ CELL+ CELLS = <> > 0<> are CODE (STC dual-tail).
 
 \ --- Compile state ----------------------------------------------------------
 DOC" [ ( -- ) enter interpret state (immediate)"
 : [  0 STATE !  ; IMMEDIATE
 DOC" ] ( -- ) enter compile state"
 : ] -1 STATE !  ;
-DOC" LITERAL ( C: x -- ) ( -- x ) compile literal (immediate)"
-: LITERAL  POSTPONE LIT  ,  ; IMMEDIATE
+\ LITERAL is CODE (STC mov/DPUSH).
 DOC" ['] ( C: 'name' -- ) ( -- xt ) compile xt of name (immediate)"
-: [']  '  POSTPONE LITERAL  ; IMMEDIATE
+: [']  ' POSTPONE LITERAL ; IMMEDIATE
 \ RECURSE is CODE (via _compile_word); do not redefine here.
 
-\ --- Control structures (BRANCH / 0BRANCH store relative offsets) -----------
-\ Compiled in asm (IF THEN ELSE BEGIN …). Bodies compile to 0BRANCH/BRANCH cells.
+\ --- Control structures (STC native branches / _stc_*_rt) -----------------
+\ Compiled in asm (IF THEN ELSE BEGIN … DO/?DO/LOOP/+LOOP).
 
-DOC" MIN ( n1 n2 -- n3 ) lesser of two"
-: MIN  ( n1 n2 -- n3 )  2DUP < IF DROP ELSE NIP THEN ;
-DOC" MAX ( n1 n2 -- n3 ) greater of two"
-: MAX  ( n1 n2 -- n3 )  2DUP < IF NIP ELSE DROP THEN ;
-
-DOC" ABS ( n -- u ) absolute value"
-: ABS   DUP 0< IF NEGATE THEN ;
-DOC" ?DUP ( x -- 0 | x x ) duplicate if nonzero"
-: ?DUP  DUP IF DUP THEN ;
-
-\ --- Arithmetic extras ------------------------------------------------------
-DOC" /MOD ( n1 n2 -- rem quot )"
-: /MOD  ( n1 n2 -- rem quot )  2DUP / DUP >R * - R> ;
-DOC" MOD ( n1 n2 -- n3 ) remainder"
-: MOD   /MOD DROP ;
-
-\ DO/?DO/LOOP/+LOOP are asm immediates (threaded).
-\ DO leaves ( 0 dest ); ?DO leaves ( orig dest ). Offsets are relative.
+\ MIN MAX ABS ?DUP /MOD MOD are CODE (STC dual-tail).
 
 \ --- I/O --------------------------------------------------------------------
-DOC" CR ( -- ) emit newline"
-: CR      10 EMIT ;
-DOC" SPACE ( -- ) emit one space"
-: SPACE   BL EMIT ;
-DOC" SPACES ( n -- ) emit n spaces"
-: SPACES  BEGIN DUP WHILE SPACE 1 - REPEAT DROP ;
-DOC" COUNT ( c-addr1 -- c-addr2 u ) from counted string"
-: COUNT   DUP C@ SWAP 1 + SWAP ;
-DOC" TYPE ( c-addr u -- ) emit string"
-: TYPE    BEGIN DUP WHILE OVER C@ EMIT SWAP 1 + SWAP 1 - REPEAT 2DROP ;
+\ CR SPACE SPACES COUNT TYPE are CODE (STC dual-tail).
 DOC" DOT-QUOTE ( C: ccc -- ) compile print of string (immediate)"
 \ Interpret or compile: print until " (ANS ." is compile-only; we allow both).
 \ 34 = ASCII '"' — avoid [CHAR] (defined later / may be absent).
-: ."
-    STATE @ IF  POSTPONE S"  POSTPONE TYPE
-    ELSE  34 PARSE TYPE  THEN  ; IMMEDIATE
+\ ." is CODE (immediate; STC-aware via S" compile path).
+\ : ." STATE @ IF POSTPONE S" POSTPONE TYPE ELSE 34 PARSE TYPE THEN ; IMMEDIATE
 DOC" .( ( -- ) print text until ) immediately (immediate; Core Ext)"
 \ Skip leading spaces/tabs (ANS), then PARSE to ')' and TYPE.
 \ 41 = ASCII ')'.
@@ -135,12 +77,8 @@ DOC" .( ( -- ) print text until ) immediately (immediate; Core Ext)"
     41 PARSE TYPE ; IMMEDIATE
 
 \ --- Memory words
-DOC" CMOVE ( c-addr1 c-addr2 u -- ) copy u chars low→high"
-: CMOVE  ( c-addr1 c-addr2 u -- )
-    BEGIN DUP WHILE
-        >R  OVER C@  OVER C!  1 + SWAP 1 + SWAP  R> 1 -
-    REPEAT  2DROP DROP ;
-    
+\ CMOVE is CODE (STC dual-tail).
+
 \ --- Number base ------------------------------------------------------------
 DOC" DECIMAL ( -- ) set BASE to 10"
 : DECIMAL  10 BASE ! ;
@@ -165,8 +103,7 @@ DOC" .S ( -- ) print data stack contents"
      THEN DROP CR ;
 
 \ --- Pictured numeric output (64Forth-style) --------------------------------
-DOC" +! ( n a-addr -- ) add n to cell at a-addr"
-: +!  ( n a-addr -- )  DUP @ ROT + SWAP ! ;
+\ +! is CODE (STC dual-tail).
 DOC" HLD ( -- a-addr ) pictured-output pointer variable"
 VARIABLE HLD
 DOC" <# ( -- ) begin pictured numeric output"
@@ -214,14 +151,7 @@ DOC" ALIGNED ( addr -- a-addr ) align upward to cell"
 : ALIGNED  7 + 7 INVERT AND ;
 DOC" ALIGN ( -- ) align HERE to cell boundary"
 : ALIGN  HERE ALIGNED HERE - ALLOT ;
-DOC" CHAR+ ( c-addr -- c-addr' ) add one character"
-: CHAR+  1+ ;
-DOC" 2@ ( addr -- x1 x2 ) fetch two cells (x2 from addr, x1 from addr+CELL)"
-: 2@  DUP CELL+ @ SWAP @ ;
-DOC" 2! ( x1 x2 addr -- ) store two cells (x2 at addr, x1 at addr+CELL)"
-: 2!  SWAP OVER ! CELL+ ! ;
-DOC" UNDER+ ( a x b -- a+b x ) add b under x"
-: UNDER+  ROT + SWAP ;
+\ CHAR+ 2@ 2! UNDER+ are CODE (STC dual-tail).
 DOC" FILL ( addr u b -- ) fill u bytes at addr with b"
 : FILL  >R BEGIN DUP WHILE OVER R@ SWAP C! SWAP 1+ SWAP 1- REPEAT R> DROP 2DROP ;
 DOC" ERASE ( addr u -- ) fill u bytes with zero"
@@ -265,9 +195,6 @@ DOC" ABORT-QUOTE ( flag -- ) if flag nonzero type message and ABORT (immediate)"
     POSTPONE IF POSTPONE S" POSTPONE TYPE POSTPONE CR
     POSTPONE ABORT POSTPONE THEN
   ELSE 34 PARSE ROT IF TYPE CR ABORT THEN 2DROP THEN ; IMMEDIATE
-DOC" DOCOL? ( xt -- flag ) true if colon (CFA holds DOCOL)"
-: DOCOL?  @ DOCOL-ADDR = ;
-
 DOC" (CONTEXT) ( -- wid ) first search-order wordlist, or FORTH"
 : (CONTEXT)  GET-ORDER ?DUP 0= IF FORTH-WORDLIST EXIT THEN
   BEGIN DUP 1 > WHILE SWAP DROP 1- REPEAT DROP ;
@@ -319,25 +246,14 @@ DOC" WORDS ( ['filter'] -- ) list CONTEXT names; optional substring filter"
         >LINK @
     REPEAT DROP R> DROP CR ;
 
-\ --- SEE (ITC decompiler; 64Forth-style, plus DO/?DO offsets) ----------------
-\ Colon bodies: walk xt cells until EXIT. Special inline payloads:
-\   LIT value | (S") len bytes | BRANCH/0BRANCH/(?DO)/(LOOP)/(+LOOP) offset
-\ (DO) has no trailing cell. CODE: header + (primitive).
+DOC" STC-COLON? ( xt -- flag ) true if STC colon (CFA → xt+8)"
+: STC-COLON?  ( xt -- flag )
+  DUP XT? 0= IF DROP FALSE EXIT THEN
+  DUP @ SWAP 8 + = ;
 
-DOC" (SEE-BR?) ( xt -- flag ) SEE: branch/loop runtime with offset cell?"
-: (SEE-BR?) ( xt -- flag )
-    >R
-    R@ BRANCH-ADDR =  R@ 0BRANCH-ADDR = OR
-    R@ LOOP-ADDR = OR  R@ PLUSLOOP-ADDR = OR
-    R@ QDO-ADDR = OR
-    R> DROP ;
-
-DOC" (SEE-HDR) ( xt -- xt ) print :/CODE tag and help or name"
-: (SEE-HDR) ( xt -- xt )
-    DUP DOCOL? IF
-        58 EMIT SPACE
-    ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN
-    DUP >HELP COUNT DUP IF TYPE ELSE 2DROP DUP NAME>STRING TYPE THEN CR ;
+\ --- SEE / HELP / LOCATE (stub; ITC decompiler removed) ---------------------
+\ Prints : or CODE tag from STC-COLON?, help or name, optional VIEW leaf:line,
+\ then (primitive). Full STC disassembly is a later pass.
 
 VARIABLE VIEW-LEAF-A
 VARIABLE VIEW-LEAF-U
@@ -361,40 +277,18 @@ DOC" (SEE-WHERE) ( xt -- ) print leaf:line when VIEW known"
     VIEW-PATH DUP 0= IF 2DROP DROP EXIT THEN
     (VIEW-BASENAME) TYPE 58 EMIT VIEW-LINE . CR ;
 
-DOC" (SEE-PRIM) ( xt -- ) print (primitive) for non-colon"
-: (SEE-PRIM) ( xt -- )
-    DROP
+DOC" (SEE-HDR) ( xt -- xt ) print :/CODE tag and help or name"
+: (SEE-HDR) ( xt -- xt )
+    DUP STC-COLON? IF
+        58 EMIT SPACE
+    ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN
+    DUP >HELP COUNT DUP IF TYPE ELSE 2DROP DUP NAME>STRING TYPE THEN CR ;
+
+DOC" SEE ( 'name' -- ) show help/tag; body listed as (primitive)"
+: SEE ( "name" -- )
+    ' (SEE-HDR) DUP (SEE-WHERE) DROP
     40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT
     105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR ;
-
-DOC" (SEE-STEP) ( addr -- addr'|0 ) decompile one body cell"
-: (SEE-STEP) ( addr -- addr' )
-    DUP @ >R
-    R@ EXIT-ADDR = IF R> DROP DROP 59 EMIT CR 0 EXIT THEN
-    R@ LIT-ADDR = IF R> DROP 8 + DUP @ . SPACE 8 + EXIT THEN
-    R@ SLIT-ADDR = IF
-        R> DROP 8 + DUP @ >R 8 +
-        83 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE
-        R> + ALIGNED EXIT THEN
-    R@ CSTR-ADDR = IF
-        R> DROP 8 + DUP C@ >R 1+
-        67 EMIT 34 EMIT SPACE DUP R@ TYPE 34 EMIT SPACE
-        R> + ALIGNED EXIT THEN
-    R@ (SEE-BR?) IF
-        R@ NAME>STRING TYPE SPACE R> DROP
-        8 + DUP @ . SPACE 8 + EXIT THEN
-    R@ NAME>STRING TYPE SPACE R> DROP 8 + ;
-
-\ (SEE-HDR) is ( xt -- xt ). After the body walk, UNTIL leaves the 0 sentinel
-\ for one DROP. Do not DUP before (SEE-HDR) — that was the 64Forth stack leak.
-DOC" SEE ( 'name' -- ) show help and decompile word"
-: SEE ( "name" -- )
-    ' (SEE-HDR) DUP (SEE-WHERE)
-    DUP DOCOL? IF
-        >BODY BEGIN (SEE-STEP) DUP 0= UNTIL DROP
-    ELSE
-        (SEE-PRIM)
-    THEN ;
 
 DOC" LOCATE ( 'name' -- ) print source leaf:line"
 : LOCATE
@@ -461,12 +355,7 @@ DOC" .WORDLISTS ( -- ) synonym of .VOCABULARIES"
 : .WORDLISTS  .VOCABULARIES ;
 
 \ --- Unsigned compare + DUMP (from 64Forth) ---------------------------------
-DOC" U< ( u1 u2 -- flag ) unsigned less than"
-: U<  ( u1 u2 -- flag )
-    2DUP XOR 0< IF SWAP DROP 0< ELSE - 0< THEN ;
-
-DOC" WITHIN ( n1 n2 n3 -- flag ) true if n2 <= n1 < n3 (unsigned wrap)"
-: WITHIN  ( n1 n2 n3 -- flag )  OVER - >R - R> U< ;
+\ U< WITHIN are CODE (STC dual-tail).
 
 DOC" .H2 ( b -- ) print byte as 2 hex digits"
 : .H2  255 AND 0 <# # # #> TYPE ;

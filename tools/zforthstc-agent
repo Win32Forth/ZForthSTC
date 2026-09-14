@@ -4,7 +4,7 @@
 #
 # Usage:
 #   ./tools/zforthstc-agent -e '2 2 + .'
-#   ./tools/zforthstc-agent -e 'STC : 1+ 1 + ; 5 1+ .'
+#   ./tools/zforthstc-agent -e ': 1+ 1 + ; 5 1+ .'
 #   ./tools/zforthstc-agent -c ~/Documents/XCodeProjects/ZForthSTC -f smoke.fth -o /tmp/out.txt
 #   ./tools/zforthstc-agent --help
 #

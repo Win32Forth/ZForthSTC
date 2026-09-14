@@ -107,6 +107,7 @@ enum AgentChannel {
         }
 
         if parsed.autoload {
+            // Colon compile is STC-only; autoload.fth must be STC-clean.
             appendOut("[ZForthSTC agent] AutoLoad…\n")
             if let auto = Bundle.main.resourceURL?
                 .appendingPathComponent("AutoLoad/autoload.fth", isDirectory: false),
