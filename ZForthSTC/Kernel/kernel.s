@@ -143,6 +143,7 @@ wordlist_reg_n: .quad 0
 // TRAVERSE-WORDLIST visitor return: IP → tw_continue_cell → tw_continue_cfa → XTW_CONTINUE
 tw_continue_cfa:  .quad 0
 tw_continue_cell: .quad 0
+stc_mode:       .quad 0          // 0=ITC compile (boot); 1=STC compile
 state_var:      .quad 0
 base_var:       .quad 10
 last_cfa:       .quad 0
@@ -1282,6 +1283,24 @@ _colon_fail:
     mov  x2, #16
     bl   _sys_write
     b    _die
+
+BOOT_WORD "STC-SMOKE", "STC-SMOKE ( -- ) emit RET at HERE and call it", 0, XSTCSMOKE, 0
+XSTCSMOKE:
+    adrp x0, here_ptr@page
+    add  x0, x0, here_ptr@pageoff
+    ldr  x1, [x0]
+    add  x1, x1, #3
+    and  x1, x1, #-4
+    str  x1, [x0]
+    str  x1, [sp, #-16]!
+    bl   _compile_ret
+    ldr  x0, [sp]
+    mov  x1, #4
+    bl   _kernel_jit_write_end
+    ldr  x16, [sp], #16
+    blr  x16
+    bl   _kernel_jit_write_begin
+    NEXT
 
 // ----------------------------------------------------------------------------
 // File-Access
@@ -2670,6 +2689,63 @@ _compile_cell:
     str  x0, [x2], #8
     str  x2, [x1]
     ret
+    
+// x0 = 32-bit instruction. Align HERE to 4, store, advance 4.
+_emit_u32:
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x2, [x1]
+    add  x2, x2, #3
+    and  x2, x2, #-4
+    str  w0, [x2], #4
+    str  x2, [x1]
+    ret
+
+// x0 = destination address (code to call).
+// Emits: adrp x16, dest@page ; add x16, x16, dest@pageoff ; blr x16
+_compile_call:
+    stp  x29, x30, [sp, #-16]!
+    mov  x3, x0                    // dest
+    // ADRP x16, dest@page  (Rd=16, page delta from HERE after this insn)
+    adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    ldr  x2, [x1]
+    add  x2, x2, #3
+    and  x2, x2, #-4               // addr of adrp
+    mov  x4, x3
+    mov  x5, x2
+    lsr  x4, x4, #12
+    lsr  x5, x5, #12
+    sub  x4, x4, x5                // page delta
+    // immlo = bits 1:0 of delta, immhi = bits 20:2
+    and  x6, x4, #3
+    lsl  x6, x6, #29
+    lsr  x7, x4, #2
+    and  x7, x7, #0x7FFFF
+    lsl  x7, x7, #5
+    movz x0, #0x0010
+    movk x0, #0x9000, lsl #16          // adrp x16
+    orr  x0, x0, x6
+    orr  x0, x0, x7
+    bl   _emit_u32
+    // ADD x16, x16, #lo12(dest)
+    and  x0, x3, #0xFFF
+    lsl  x0, x0, #10
+    movz x1, #0x0210
+    movk x1, #0x9100, lsl #16           // add x16, x16, #0
+    orr  x0, x0, x1
+    bl   _emit_u32
+    // BLR x16
+    movz x0, #0x0200
+    movk x0, #0xD63F, lsl #16
+    bl   _emit_u32
+    ldp  x29, x30, [sp], #16
+    ret
+
+_compile_ret:
+    movz x0, #0x03C0
+    movk x0, #0xD65F, lsl #16           // ret
+    b    _emit_u32
 
 _cstrlen:
     mov  x1, x0
@@ -4274,15 +4350,16 @@ _kernel_cold_start:
     // Fall back to BSS user_dict if mmap fails (ITC still works).
     mov  x0, #USER_DICT_SIZE
     bl   _kernel_alloc_dict
-    cbnz x0, 2f
+    cbnz x0, 1f
     adrp x0, user_dict@page
     add  x0, x0, user_dict@pageoff
+    b    2f
+1:  str  x0, [sp, #-16]!
+    bl   _kernel_jit_write_begin
+    ldr  x0, [sp], #16
 2:  adrp x1, here_ptr@page
     add  x1, x1, here_ptr@pageoff
     str  x0, [x1]
-    adrp x0, state_var@page
-    add  x0, x0, state_var@pageoff
-    str  xzr, [x0]
 
     adrp x0, source_sp@page
     add  x0, x0, source_sp@pageoff

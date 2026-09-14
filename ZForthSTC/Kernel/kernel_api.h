@@ -9,6 +9,9 @@ extern "C" {
 #endif
 
 void *kernel_alloc_dict(size_t n);
+void kernel_jit_write_begin(void);
+void kernel_jit_write_end(void *addr, size_t len);
+void *kernel_alloc_dict(size_t n);
 void kernel_cold_start(void);
 int  kernel_eval(const char *line, size_t n);
 int  kernel_data_depth(void);
