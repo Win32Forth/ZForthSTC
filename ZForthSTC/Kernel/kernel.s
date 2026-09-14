@@ -4270,12 +4270,16 @@ _kernel_cold_start:
     add  x0, x0, current_var@pageoff
     str  xzr, [x0]
 
-    adrp x0, here_ptr@page
-    add  x0, x0, here_ptr@pageoff
-    adrp x1, user_dict@page
-    add  x1, x1, user_dict@pageoff
-    str  x1, [x0]
-
+    // M1: prefer an RX/RWX mmap so later STC can execute HERE.
+    // Fall back to BSS user_dict if mmap fails (ITC still works).
+    mov  x0, #USER_DICT_SIZE
+    bl   _kernel_alloc_dict
+    cbnz x0, 2f
+    adrp x0, user_dict@page
+    add  x0, x0, user_dict@pageoff
+2:  adrp x1, here_ptr@page
+    add  x1, x1, here_ptr@pageoff
+    str  x0, [x1]
     adrp x0, state_var@page
     add  x0, x0, state_var@pageoff
     str  xzr, [x0]
