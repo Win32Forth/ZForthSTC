@@ -4431,7 +4431,7 @@ ansfile_fth_end:
 .section __TEXT,__const
 .align 3
 banner:
-    .ascii "16Forth 0.7 ready === Sep 12, 2026 10:02 AM ===\n"
+    .ascii "16ForthSTC 0.1 ready === Sep 13, 2026 09:37 PM ===\n"
 .equ banner_len, . - banner
 
 .align 3
