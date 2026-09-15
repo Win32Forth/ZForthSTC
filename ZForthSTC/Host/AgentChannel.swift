@@ -15,7 +15,7 @@
 //  Usage examples:
 //    ZForthSTC --agent -e '2 2 + .'
 //    ZForthSTC --agent -f /path/to/script.fth -o /tmp/out.txt
-//    ZForthSTC --agent --cwd ~/Documents/XCodeProjects/ZForthSTC -e 'STC : 1+ 1 + ; 5 1+ .'
+//    ZForthSTC --agent --cwd ~/Documents/XCodeProjects/ZForthSTC -e ': 1+ 1 + ; 5 1+ .'
 //    ZForthSTC --agent --repl < commands.txt
 //    ZFORTHSTC_AGENT=1 ZForthSTC -e 'WORDS'
 //
@@ -107,7 +107,7 @@ enum AgentChannel {
         }
 
         if parsed.autoload {
-            // Colon compile is STC-only; autoload.fth must be STC-clean.
+            // Colon compile is always native; autoload.fth must match.
             appendOut("[ZForthSTC agent] AutoLoad…\n")
             if let auto = Bundle.main.resourceURL?
                 .appendingPathComponent("AutoLoad/autoload.fth", isDirectory: false),
@@ -341,7 +341,7 @@ enum AgentChannel {
 
         Examples:
           ZForthSTC --agent -e '2 2 + .'
-          ZForthSTC --agent -e 'STC : 1+ 1 + ; 5 1+ .'
+          ZForthSTC --agent -e ': 1+ 1 + ; 5 1+ .'
           ZForthSTC --agent -c ~/proj -f smoke.fth -o /tmp/out.txt
           ZForthSTC --agent --repl < session.txt
 

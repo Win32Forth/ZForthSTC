@@ -1,6 +1,6 @@
 //
 //  kernel.s
-//  16Forth
+//  ZForthSTC
 //
 //  Minimal 64Forth-derived kernel — memory data stack (no TOS-in-register)
 //
@@ -47,6 +47,9 @@
 .equ DICT_THREADS, 1
 .equ WORDLIST_REG_MAX, 128
 .equ SEARCH_ORDER_MAX, 8
+.equ LOCAL_MAX, 32
+.equ LOCAL_NAME_STR, 32
+.equ LOCAL_FRAME_MAX, 16
 
 .macro DPUSH reg
     str  \reg, [x22, #-8]!  // 1  store TOS-to-be at [DSP-8], DSP -= 8
@@ -161,6 +164,19 @@ pending_help_len:  .quad 0
 pending_help_buf:  .space 256    // NUL-terminated copy for _header_build
 .align 3
 cquote_pad:        .space 256    // interpret-mode C" counted string scratch
+// Locals (ANS): compile-time name table + runtime frames (from 64Forth)
+local_name_count:   .quad 0
+local_init_count:   .quad 0
+local_init_reverse: .quad 0
+local_brace_phase:  .quad 0      // {: phase: 0=args 1=vals 2=skip outs
+local_declaring:    .quad 0      // 1 while (LOCAL) sequence open
+.align 3
+local_names:        .skip LOCAL_MAX * LOCAL_NAME_STR
+local_frame_depth:  .quad 0
+.align 3
+local_frame_rsp:    .skip LOCAL_FRAME_MAX * 8
+local_frame_n:      .skip LOCAL_FRAME_MAX * 8
+local_frames:       .skip LOCAL_FRAME_MAX * LOCAL_MAX * 8
 source_id_var:  .quad 0          // 0=user/eval, -1=EVALUATE, 1=malloc INCLUDE, 2=host INCLUDE
 .equ SRC_MAX, 8
 .equ SRC_FRAME, 40               // addr,len,>IN,id,file_echo_pos
@@ -233,6 +249,13 @@ BOOT_WORD "@", "@ ( a -- n )", 0, XFETCH, 262
 XFETCH:
     ldr  x0, [x22]
     ldr  x0, [x0]
+    str  x0, [x22]
+    STC_TAIL
+
+BOOT_WORD "L@", "L@ ( addr -- u ) zero-extend 32-bit fetch (SEE insn)", 0, XLFETCH, 0
+XLFETCH:
+    ldr  x0, [x22]
+    ldr  w0, [x0]
     str  x0, [x22]
     STC_TAIL
 
@@ -788,6 +811,7 @@ _colon_common:
     mov  x2, xzr
     mov  x3, xzr                    // CFA placeholder; patched to HERE below
     bl   _header_build
+    bl   _local_compile_reset
 
     // STC-only: always native body.
     adrp x0, stc_mode@page
@@ -827,6 +851,7 @@ XNONAME:
     mov  x2, #0
     mov  x3, xzr                    // CFA placeholder; patched to HERE below
     bl   _header_build
+    bl   _local_compile_reset
 
     adrp x0, stc_mode@page
     add  x0, x0, stc_mode@pageoff
@@ -870,11 +895,8 @@ XSEMI:
     ldr  x2, [x1]
     cbz  x2, 4f
     str  xzr, [x1]
-4:  // STC epilogue: ldr x30, [x23], #8  then ret
-    movz x0, #0x86FE
-    movk x0, #0xF840, lsl #16
-    bl   _emit_u32
-    bl   _compile_ret
+4:  bl   _compile_colon_epilogue
+    bl   _local_compile_reset
     adrp x0, state_var@page
     add  x0, x0, state_var@pageoff
     str  xzr, [x0]
@@ -1622,26 +1644,6 @@ _colon_fail:
     mov  x2, #16
     bl   _sys_write
     b    _die
-
-BOOT_WORD "STC-SMOKE", "STC-SMOKE ( -- ) emit RET at HERE and call it", 0, XSTCSMOKE, 0
-XSTCSMOKE:
-    CODE_SAVE_LR
-    adrp x0, here_ptr@page
-    add  x0, x0, here_ptr@pageoff
-    ldr  x1, [x0]
-    add  x1, x1, #3
-    and  x1, x1, #-4
-    str  x1, [x0]
-    str  x1, [sp, #-16]!
-    bl   _compile_ret
-    ldr  x0, [sp]
-    mov  x1, #4
-    bl   _kernel_jit_write_end
-    ldr  x16, [sp], #16
-    blr  x16
-    bl   _kernel_jit_write_begin
-    CODE_RESTORE_LR
-    STC_TAIL
 
 // ----------------------------------------------------------------------------
 // File-Access
@@ -2596,9 +2598,569 @@ XRSHIFT:
     DPUSH x0
     STC_TAIL
 
-// SEE *-ADDR / DOCOL-ADDR helpers removed with ITC decompiler.
+// ============================================================================
+// Locals (ANS-style from 64Forth): {: … :}  TO  (LOCAL)  LOCAL-INIT
+// Runtime frames in BSS; compile-time names for current definition.
+// STC: local fetch/store compile as lit + blr (LOCAL@)/(LOCAL!).
+// Generally BAD to mix >R/R> with locals (RSP markers for frame exit).
+// ============================================================================
 
-// STC? ( xt -- flag ): true if CFA code is user-dict STC body or _stc_dodoes.
+// LOCAL-INIT ( nLocals nInit reverse -- )
+BOOT_WORD "LOCAL-INIT", "LOCAL-INIT ( n nInit rev -- ) create locals frame", 0, XLOCAL_INIT, 0
+XLOCAL_INIT:
+    DPOP x2                        // reverse
+    DPOP x1                        // nInit
+    DPOP x0                        // nLocals
+    cmp  x0, #LOCAL_MAX
+    b.ls 1f
+    mov  x0, #LOCAL_MAX
+1:  cmp  x1, x0
+    b.ls 2f
+    mov  x1, x0
+2:  adrp x3, local_frame_depth@page
+    add  x3, x3, local_frame_depth@pageoff
+    ldr  x4, [x3]
+    cmp  x4, #LOCAL_FRAME_MAX
+    b.hs 9f
+    mov  x5, #LOCAL_MAX
+    mul  x5, x5, x4
+    lsl  x5, x5, #3
+    adrp x6, local_frames@page
+    add  x6, x6, local_frames@pageoff
+    add  x6, x6, x5
+    mov  x7, #0
+3:  cmp  x7, x0
+    b.hs 4f
+    str  xzr, [x6, x7, lsl #3]
+    add  x7, x7, #1
+    b    3b
+4:  cbz  x2, 5f
+    mov  x7, x1
+6:  cbz  x7, 7f
+    sub  x7, x7, #1
+    DPOP x8
+    str  x8, [x6, x7, lsl #3]
+    b    6b
+5:  mov  x7, #0
+8:  cmp  x7, x1
+    b.hs 7f
+    DPOP x8
+    str  x8, [x6, x7, lsl #3]
+    add  x7, x7, #1
+    b    8b
+7:  adrp x5, local_frame_rsp@page
+    add  x5, x5, local_frame_rsp@pageoff
+    str  x23, [x5, x4, lsl #3]
+    adrp x5, local_frame_n@page
+    add  x5, x5, local_frame_n@pageoff
+    str  x0, [x5, x4, lsl #3]
+    add  x4, x4, #1
+    str  x4, [x3]
+    STC_TAIL
+9:  // Frame table full: drain nInit values (control args already popped).
+    mov  x7, x1
+10: cbz  x7, 11f
+    DPOP xzr
+    sub  x7, x7, #1
+    b    10b
+11: STC_TAIL
+
+BOOT_WORD "(LOCAL@)", "(LOCAL@) ( idx -- x ) fetch local", 0, XLOCAL_AT, 0
+XLOCAL_AT:
+    DPOP x0
+    adrp x1, local_frame_depth@page
+    add  x1, x1, local_frame_depth@pageoff
+    ldr  x1, [x1]
+    cbz  x1, 1f
+    sub  x1, x1, #1
+    mov  x2, #LOCAL_MAX
+    mul  x2, x2, x1
+    lsl  x2, x2, #3
+    adrp x3, local_frames@page
+    add  x3, x3, local_frames@pageoff
+    add  x3, x3, x2
+    adrp x2, local_frame_n@page
+    add  x2, x2, local_frame_n@pageoff
+    ldr  x2, [x2, x1, lsl #3]
+    cmp  x0, x2
+    b.hs 1f
+    ldr  x0, [x3, x0, lsl #3]
+    DPUSH x0
+    STC_TAIL
+1:  DPUSH xzr
+    STC_TAIL
+
+BOOT_WORD "(LOCAL!)", "(LOCAL!) ( x idx -- ) store local", 0, XLOCAL_STORE, 0
+XLOCAL_STORE:
+    DPOP x0                        // idx
+    DPOP x1                        // x
+    adrp x2, local_frame_depth@page
+    add  x2, x2, local_frame_depth@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 1f
+    sub  x2, x2, #1
+    mov  x3, #LOCAL_MAX
+    mul  x3, x3, x2
+    lsl  x3, x3, #3
+    adrp x4, local_frames@page
+    add  x4, x4, local_frames@pageoff
+    add  x4, x4, x3
+    adrp x3, local_frame_n@page
+    add  x3, x3, local_frame_n@pageoff
+    ldr  x3, [x3, x2, lsl #3]
+    cmp  x0, x3
+    b.hs 1f
+    str  x1, [x4, x0, lsl #3]
+1:  STC_TAIL
+
+// (LOCAL) ( c-addr u -- ) ANS 13.6.1.0086 — compile-time only
+BOOT_WORD "(LOCAL)", "(LOCAL) ( c-addr u -- ) declare local or end locals", 0, XLOCAL_PAREN, 0
+XLOCAL_PAREN:
+    CODE_SAVE_LR
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    DPOP x1                        // u
+    DPOP x0                        // c-addr
+    cbz  x1, _lparen_last
+    adrp x2, local_declaring@page
+    add  x2, x2, local_declaring@pageoff
+    ldr  x3, [x2]
+    cbnz x3, 1f
+    stp  x0, x1, [sp, #-16]!
+    bl   _local_compile_reset
+    ldp  x0, x1, [sp], #16
+    adrp x3, local_init_reverse@page
+    add  x3, x3, local_init_reverse@pageoff
+    str  xzr, [x3]
+    mov  x3, #1
+    str  x3, [x2]
+1:  bl   _local_add_name
+    adrp x2, local_init_count@page
+    add  x2, x2, local_init_count@pageoff
+    ldr  x3, [x2]
+    add  x3, x3, #1
+    str  x3, [x2]
+    b    9f
+_lparen_last:
+    adrp x2, local_declaring@page
+    add  x2, x2, local_declaring@pageoff
+    ldr  x3, [x2]
+    cbnz x3, 2f
+    bl   _local_compile_reset
+    adrp x3, local_init_reverse@page
+    add  x3, x3, local_init_reverse@pageoff
+    str  xzr, [x3]
+2:  bl   _local_finalize_compile
+    adrp x2, local_declaring@page
+    add  x2, x2, local_declaring@pageoff
+    str  xzr, [x2]
+9:  CODE_RESTORE_LR
+    STC_TAIL
+
+// {: immediate — parse args | vals -- outs :} then compile LOCAL-INIT
+BOOT_WORD "{:", "{: ( -- ) declare locals {: args | vals -- outs :}", FL_IMM, XLOCAL_BRACE, 0
+XLOCAL_BRACE:
+    CODE_SAVE_LR
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+    bl   _local_compile_reset
+    adrp x0, local_declaring@page
+    add  x0, x0, local_declaring@pageoff
+    str  xzr, [x0]
+    mov  x0, #1
+    adrp x1, local_init_reverse@page
+    add  x1, x1, local_init_reverse@pageoff
+    str  x0, [x1]
+    adrp x1, local_brace_phase@page
+    add  x1, x1, local_brace_phase@pageoff
+    str  xzr, [x1]
+_lb_loop:
+    bl   _next_word
+    cbz  x1, _lb_done
+    cmp  x1, #2
+    b.ne 1f
+    ldrb w2, [x0]
+    cmp  w2, #':'
+    b.ne 1f
+    ldrb w2, [x0, #1]
+    cmp  w2, #'}'
+    b.eq _lb_done
+1:  cmp  x1, #1
+    b.ne 2f
+    ldrb w2, [x0]
+    cmp  w2, #'|'
+    b.ne 2f
+    mov  x2, #1
+    adrp x3, local_brace_phase@page
+    add  x3, x3, local_brace_phase@pageoff
+    str  x2, [x3]
+    b    _lb_loop
+2:  cmp  x1, #2
+    b.ne 3f
+    ldrb w2, [x0]
+    cmp  w2, #'-'
+    b.ne 3f
+    ldrb w2, [x0, #1]
+    cmp  w2, #'-'
+    b.ne 3f
+    mov  x2, #2
+    adrp x3, local_brace_phase@page
+    add  x3, x3, local_brace_phase@pageoff
+    str  x2, [x3]
+    b    _lb_loop
+3:  adrp x3, local_brace_phase@page
+    add  x3, x3, local_brace_phase@pageoff
+    ldr  x3, [x3]
+    cmp  x3, #2
+    b.eq _lb_loop
+    bl   _local_add_name
+    adrp x3, local_brace_phase@page
+    add  x3, x3, local_brace_phase@pageoff
+    ldr  x3, [x3]
+    cbnz x3, _lb_loop
+    adrp x2, local_init_count@page
+    add  x2, x2, local_init_count@pageoff
+    ldr  x3, [x2]
+    add  x3, x3, #1
+    str  x3, [x2]
+    b    _lb_loop
+_lb_done:
+    bl   _local_finalize_compile
+9:  CODE_RESTORE_LR
+    STC_TAIL
+
+// LOCALS| — obsolescent ANS; names until | then end (LOCAL)
+BOOT_WORD "LOCALS|", "LOCALS| ( name... | -- ) declare locals (immediate)", FL_IMM, XLOCALS_BAR, 0
+XLOCALS_BAR:
+    CODE_SAVE_LR
+    adrp x0, state_var@page
+    add  x0, x0, state_var@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 9f
+_ls_loop:
+    bl   _next_word
+    cbz  x1, _ls_end
+    cmp  x1, #1
+    b.ne 1f
+    ldrb w2, [x0]
+    cmp  w2, #'|'
+    b.eq _ls_end
+1:  // Push c-addr u for (LOCAL) — name already in name_buf
+    DPUSH x0
+    DPUSH x1
+    bl   XLOCAL_PAREN
+    b    _ls_loop
+_ls_end:
+    DPUSH xzr
+    DPUSH xzr
+    bl   XLOCAL_PAREN
+9:  CODE_RESTORE_LR
+    STC_TAIL
+
+// TO immediate — local store if name is local
+BOOT_WORD "TO", "TO ( x \"name\" -- ) store to local (immediate)", FL_IMM, XTO_IMM, 0
+XTO_IMM:
+    CODE_SAVE_LR
+    bl   _next_word
+    cbz  x1, 9f
+    adrp x2, state_var@page
+    add  x2, x2, state_var@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 9f                    // interpret: no VALUE yet; no-op
+    bl   _local_lookup
+    cmp  x0, #-1
+    b.eq 9f
+    bl   _compile_lit              // x0 = idx
+    adrp x0, XLOCAL_STORE@page
+    add  x0, x0, XLOCAL_STORE@pageoff
+    bl   _compile_call
+9:  CODE_RESTORE_LR
+    STC_TAIL
+
+BOOT_WORD "(LOCAL-FRAME-EXIT)", "(LOCAL-FRAME-EXIT) ( -- ) pop locals frame if RSP matches", 0, XLOCAL_FRAME_EXIT, 0
+XLOCAL_FRAME_EXIT:
+_local_frame_try_exit:
+    adrp x0, local_frame_depth@page
+    add  x0, x0, local_frame_depth@pageoff
+    ldr  x1, [x0]
+    cbz  x1, 1f
+    sub  x1, x1, #1
+    adrp x2, local_frame_rsp@page
+    add  x2, x2, local_frame_rsp@pageoff
+    ldr  x2, [x2, x1, lsl #3]
+    cmp  x2, x23
+    b.ne 1f
+    str  x1, [x0]
+1:  STC_TAIL
+
+// ============================================================================
+// SEE helpers: reverse code→xt and runtime label addresses
+// ============================================================================
+
+// CODE>XT ( code -- xt|0 ): walk all registered wordlists (WORDLISTS), then
+// FORTH latest; match [cfa] == code. Includes SYSVOC even when not in order.
+BOOT_WORD "CODE>XT", "CODE>XT ( code -- xt|0 ) find xt whose CFA code is addr", 0, XCODE_TO_XT, 0
+XCODE_TO_XT:
+    DPOP x19                       // target code
+    // 1) registered wordlists (FORTH, SYSVOC, EDITOR, …)
+    adrp x0, wordlist_reg_n@page
+    add  x0, x0, wordlist_reg_n@pageoff
+    ldr  x20, [x0]
+    mov  x21, #0
+1:  cmp  x21, x20
+    b.hs 8f
+    adrp x0, wordlist_reg@page
+    add  x0, x0, wordlist_reg@pageoff
+    ldr  x25, [x0, x21, lsl #3]
+    cbz  x25, 5f
+    mov  x26, #0                   // thread
+2:  cmp  x26, #DICT_THREADS
+    b.hs 5f
+    add  x0, x25, x26, lsl #3
+    ldr  x7, [x0]                  // chain tip CFA
+3:  cbz  x7, 4f
+    ldr  x1, [x7]
+    cmp  x1, x19
+    b.eq 9f
+    ldr  x7, [x7, #-16]
+    b    3b
+4:  add  x26, x26, #1
+    b    2b
+5:  add  x21, x21, #1
+    b    1b
+8:  // fallback: FORTH latest chain (if not already in registry)
+    adrp x25, latest_var@page
+    add  x25, x25, latest_var@pageoff
+    ldr  x7, [x25]
+7:  cbz  x7, 6f
+    ldr  x1, [x7]
+    cmp  x1, x19
+    b.eq 9f
+    ldr  x7, [x7, #-16]
+    b    7b
+6:  DPUSH xzr
+    STC_TAIL
+9:  DPUSH x7
+    STC_TAIL
+
+.macro SEE_ADDR_WORD name, help, label
+BOOT_WORD "\name", "\help", 0, .Lsee_\@, 0
+.Lsee_\@:
+    adrp x0, \label@page
+    add  x0, x0, \label@pageoff
+    DPUSH x0
+    STC_TAIL
+.endm
+
+SEE_ADDR_WORD "SLIT-ADDR", "SLIT-ADDR ( -- addr ) _stc_slit for SEE", _stc_slit
+SEE_ADDR_WORD "CSTR-ADDR", "CSTR-ADDR ( -- addr ) _stc_cstr for SEE", _stc_cstr
+SEE_ADDR_WORD "CREATE-XT-ADDR", "CREATE-XT-ADDR ( -- addr ) _stc_create_xt for SEE", _stc_create_xt
+SEE_ADDR_WORD "DO-RT-ADDR", "DO-RT-ADDR ( -- addr ) _stc_do_rt for SEE", _stc_do_rt
+SEE_ADDR_WORD "QDO-RT-ADDR", "QDO-RT-ADDR ( -- addr ) _stc_qdo_rt for SEE", _stc_qdo_rt
+SEE_ADDR_WORD "LOOP-RT-ADDR", "LOOP-RT-ADDR ( -- addr ) _stc_loop_rt for SEE", _stc_loop_rt
+SEE_ADDR_WORD "PLOOP-RT-ADDR", "PLOOP-RT-ADDR ( -- addr ) _stc_plusloop_rt for SEE", _stc_plusloop_rt
+SEE_ADDR_WORD "DOES-RT-ADDR", "DOES-RT-ADDR ( -- addr ) _stc_does_rt for SEE", _stc_does_rt
+SEE_ADDR_WORD "FRAME-EXIT-ADDR", "FRAME-EXIT-ADDR ( -- addr ) (LOCAL-FRAME-EXIT) for SEE", XLOCAL_FRAME_EXIT
+
+// --- locals helpers (not dictionary words) ---
+
+_local_compile_reset:
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    str  xzr, [x0]
+    adrp x0, local_init_count@page
+    add  x0, x0, local_init_count@pageoff
+    str  xzr, [x0]
+    adrp x0, local_init_reverse@page
+    add  x0, x0, local_init_reverse@pageoff
+    str  xzr, [x0]
+    adrp x0, local_declaring@page
+    add  x0, x0, local_declaring@pageoff
+    str  xzr, [x0]
+    ret
+
+// _local_add_name: x0=addr, x1=len (uppercase into table)
+_local_add_name:
+    stp  x29, x30, [sp, #-32]!
+    stp  x19, x20, [sp, #16]
+    mov  x19, x0
+    mov  x20, x1
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x1, [x0]
+    cmp  x1, #LOCAL_MAX
+    b.hs 9f
+    mov  x2, #LOCAL_NAME_STR
+    mul  x2, x2, x1
+    adrp x3, local_names@page
+    add  x3, x3, local_names@pageoff
+    add  x3, x3, x2
+    cmp  x20, #31
+    b.ls 1f
+    mov  x20, #31
+1:  strb w20, [x3], #1
+    mov  x2, #0
+2:  cmp  x2, x20
+    b.hs 3f
+    ldrb w4, [x19, x2]
+    cmp  w4, #'a'
+    b.lo 21f
+    cmp  w4, #'z'
+    b.hi 21f
+    sub  w4, w4, #32
+21: strb w4, [x3, x2]
+    add  x2, x2, #1
+    b    2b
+3:  adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x1, [x0]
+    add  x1, x1, #1
+    str  x1, [x0]
+9:  ldp  x19, x20, [sp, #16]
+    ldp  x29, x30, [sp], #32
+    ret
+
+// _local_lookup: x0=addr x1=len -> x0=index or -1
+_local_lookup:
+    stp  x19, x20, [sp, #-32]!
+    stp  x21, xzr, [sp, #16]
+    mov  x19, x0
+    mov  x20, x1
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x21, [x0]
+    mov  x0, #0
+1:  cmp  x0, x21
+    b.hs 8f
+    mov  x2, #LOCAL_NAME_STR
+    mul  x2, x2, x0
+    adrp x3, local_names@page
+    add  x3, x3, local_names@pageoff
+    add  x3, x3, x2
+    ldrb w2, [x3], #1
+    cmp  x2, x20
+    b.ne 3f
+    mov  x4, #0
+2:  cmp  x4, x20
+    b.hs 10f
+    ldrb w5, [x3, x4]
+    ldrb w6, [x19, x4]
+    cmp  w6, #'a'
+    b.lo 21f
+    cmp  w6, #'z'
+    b.hi 21f
+    sub  w6, w6, #32
+21: cmp  w5, w6
+    b.ne 3f
+    add  x4, x4, #1
+    b    2b
+3:  add  x0, x0, #1
+    b    1b
+8:  mov  x0, #-1
+10: ldp  x21, xzr, [sp, #16]
+    ldp  x19, x20, [sp], #32
+    ret
+
+// STC: compile lit nLocals, lit nInit, lit rev, blr LOCAL-INIT
+_local_finalize_compile:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x0, [x0]
+    bl   _compile_lit
+    adrp x0, local_init_count@page
+    add  x0, x0, local_init_count@pageoff
+    ldr  x0, [x0]
+    bl   _compile_lit
+    adrp x0, local_init_reverse@page
+    add  x0, x0, local_init_reverse@pageoff
+    ldr  x0, [x0]
+    bl   _compile_lit
+    adrp x0, XLOCAL_INIT@page
+    add  x0, x0, XLOCAL_INIT@pageoff
+    bl   _compile_call
+    ldp  x29, x30, [sp], #16
+    ret
+
+// Parse next whitespace word into name_buf. Out: x0=addr, x1=len (0=EOF).
+// Does not touch HERE (safe while compiling).
+_next_word:
+    adrp x1, source_addr@page
+    add  x1, x1, source_addr@pageoff
+    ldr  x1, [x1]
+    adrp x2, source_len@page
+    add  x2, x2, source_len@pageoff
+    ldr  x2, [x2]
+    adrp x3, to_in@page
+    add  x3, x3, to_in@pageoff
+    ldr  x4, [x3]
+_nw_skip:
+    cmp  x4, x2
+    b.hs _nw_eof
+    ldrb w5, [x1, x4]
+    cmp  w5, #' '
+    b.hi _nw_start
+    add  x4, x4, #1
+    b    _nw_skip
+_nw_start:
+    mov  x6, x4
+_nw_scan:
+    cmp  x4, x2
+    b.hs _nw_got
+    ldrb w5, [x1, x4]
+    cmp  w5, #' '
+    b.ls _nw_got
+    add  x4, x4, #1
+    b    _nw_scan
+_nw_got:
+    sub  x7, x4, x6
+    cmp  x4, x2
+    b.hs 1f
+    add  x4, x4, #1                // consume delimiter
+1:  str  x4, [x3]
+    cbz  x7, _nw_eof
+    cmp  x7, #255
+    b.ls 2f
+    mov  x7, #255
+2:  adrp x0, name_buf@page
+    add  x0, x0, name_buf@pageoff
+    mov  x8, #0
+3:  cmp  x8, x7
+    b.hs 4f
+    ldrb w5, [x1, x6]
+    add  x6, x6, #1
+    strb w5, [x0, x8]
+    add  x8, x8, #1
+    b    3b
+4:  mov  x1, x7
+    ret
+_nw_eof:
+    str  x4, [x3]
+    mov  x0, #0
+    mov  x1, #0
+    ret
+
+// Emit colon epilogue; if this def used locals, call frame-exit first.
+_compile_colon_epilogue:
+    stp  x29, x30, [sp, #-16]!
+    adrp x0, local_name_count@page
+    add  x0, x0, local_name_count@pageoff
+    ldr  x0, [x0]
+    cbz  x0, 1f
+    adrp x0, XLOCAL_FRAME_EXIT@page
+    add  x0, x0, XLOCAL_FRAME_EXIT@pageoff
+    bl   _compile_call
+1:  movz x0, #0x86FE
+    movk x0, #0xF840, lsl #16      // ldr x30, [x23], #8
+    bl   _emit_u32
+    bl   _compile_ret
+    ldp  x29, x30, [sp], #16
+    ret
+
 // Shared: x0 = candidate xt.
 // Out: x0 preserved if ok; x1 = -1 ok / 0 bad. Clobbers x2–x3.
 _xt_in_dict:
@@ -2627,35 +3189,6 @@ XXT_Q:
     bl   _xt_in_dict
     ldp  x29, x30, [sp], #16
     DPUSH x1
-    STC_TAIL
-
-BOOT_WORD "STC?", "STC? ( xt -- flag ) true if xt is STC colon/stub or STC DOES>", 0, XSTC_Q, 2264
-XSTC_Q:
-    DPOP x0
-    stp  x29, x30, [sp, #-16]!
-    bl   _xt_in_dict
-    ldp  x29, x30, [sp], #16
-    cbz  x1, 1f                    // null / unaligned / outside dict
-    ldr  x1, [x0]                  // code address at CFA
-    adrp x2, _stc_dodoes@page
-    add  x2, x2, _stc_dodoes@pageoff
-    cmp  x1, x2
-    b.eq 2f                        // STC DOES> child
-    adrp x2, dict_base@page
-    add  x2, x2, dict_base@pageoff
-    ldr  x2, [x2]
-    adrp x3, dict_limit@page
-    add  x3, x3, dict_limit@pageoff
-    ldr  x3, [x3]
-    cmp  x1, x2
-    b.lo 1f
-    cmp  x1, x3
-    b.hs 1f
-2:  mov  x0, #-1                   // true
-    DPUSH x0
-    STC_TAIL
-1:  mov  x0, #0
-    DPUSH x0
     STC_TAIL
 
 BOOT_WORD "BASE", "BASE ( -- addr ) current numeric base variable", 0, XBASE, 2264
@@ -2837,16 +3370,6 @@ XVIEW_STAMP:
     orr  x0, x0, x2
     str  x0, [x1, #-8]
 1:  STC_TAIL
-
-BOOT_WORD "STC", "STC ( -- ) ensure STC compile (always on; no-op if already set)", 0, XSTC, 0
-XSTC:
-    adrp x0, stc_mode@page
-    add  x0, x0, stc_mode@pageoff
-    mov  x1, #1
-    str  x1, [x0]
-    STC_TAIL
-
-// ITC compile escape hatch removed — colon compile is STC-only.
 
 .section __DATA,__bootword,regular
 .quad 0, 0, 0, 0, 0
@@ -4811,7 +5334,33 @@ _interpret_loop:
     add  x1, x1, word_addr@pageoff
     str  x0, [x1]
 
-    bl   _find
+    // Compile-time locals: name → lit idx + blr (LOCAL@)
+    adrp x2, state_var@page
+    add  x2, x2, state_var@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 1f
+    adrp x2, local_name_count@page
+    add  x2, x2, local_name_count@pageoff
+    ldr  x2, [x2]
+    cbz  x2, 1f
+    ldrb w1, [x0]
+    cbz  w1, 1f
+    add  x0, x0, #1
+    // w1 = len (zero-extended into x1 by ldrb)
+    bl   _local_lookup
+    cmp  x0, #-1
+    b.eq 2f
+    stp  x29, x30, [sp, #-16]!
+    bl   _compile_lit
+    adrp x0, XLOCAL_AT@page
+    add  x0, x0, XLOCAL_AT@pageoff
+    bl   _compile_call
+    ldp  x29, x30, [sp], #16
+    b    _interpret_loop
+2:  adrp x0, word_addr@page
+    add  x0, x0, word_addr@pageoff
+    ldr  x0, [x0]
+1:  bl   _find
     cbz  x0, _try_num
 
     adrp x2, state_var@page
@@ -4976,6 +5525,10 @@ _abort:
     adrp x0, stc_running@page
     add  x0, x0, stc_running@pageoff
     str  xzr, [x0]
+    adrp x0, local_frame_depth@page
+    add  x0, x0, local_frame_depth@pageoff
+    str  xzr, [x0]
+    bl   _local_compile_reset
     // Unwind nested INCLUDE frames (free malloc'd file buffers).
 2:  bl   _pop_source
     cbnz x0, 2b
@@ -5045,13 +5598,7 @@ _compile_word:
     ldr  x1, [x1]
     cmp  x0, x1
     b.ne 1f
-    movz x0, #0x86FE
-    movk x0, #0xF840, lsl #16      // ldr x30, [x23], #8
-    stp  x29, x30, [sp, #-16]!
-    bl   _emit_u32
-    bl   _compile_ret
-    ldp  x29, x30, [sp], #16
-    ret
+    b    _compile_colon_epilogue
 1:  ldr  x1, [x0]                  // code address
     // User-dict body → direct STC blr
     adrp x2, dict_base@page
@@ -5309,11 +5856,11 @@ ansfile_fth_end:
 
 // Startup banner: update the date/time stamp when finishing a change set for a
 // version (same policy as 64Forth ConsoleView banner — not every intermediate build).
-// Format: 16Forth M.N ready === Mon D, YYYY H:MM AM/PM ===
+// Format: ZForthSTC M.N ready === Mon D, YYYY H:MM AM/PM ===
 .section __TEXT,__const
 .align 3
 banner:
-    .ascii "16ForthSTC 0.2 ready === Sep 14, 2026 12:00 PM ===\n"
+    .ascii "ZForthSTC 0.8 ready === Sep 14, 2026 8:21 PM ===\n"
 .equ banner_len, . - banner
 
 .align 3

@@ -1,5 +1,5 @@
 \  ansfile.fth
-\  16ForthCLI
+\  ZForthSTC
 \
 \  Created by Tom's MacBook Air on 8/25/26.
 \

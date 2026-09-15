@@ -1,4 +1,4 @@
-\ High-level 16Forth — loaded after the 16 inner primitives and the
+\ High-level ZForthSTC — loaded after the inner primitives and the
 \ assembly bootstrap compiler (: ; CREATE DOES> , HERE POSTPONE ...).
 \ This file is real Forth, not .ascii embedded in the assembler.
 \ PARSE / SETDOC are CODE; DOC" arms help for the next : / CREATE.
@@ -246,14 +246,9 @@ DOC" WORDS ( ['filter'] -- ) list CONTEXT names; optional substring filter"
         >LINK @
     REPEAT DROP R> DROP CR ;
 
-DOC" STC-COLON? ( xt -- flag ) true if STC colon (CFA → xt+8)"
-: STC-COLON?  ( xt -- flag )
-  DUP XT? 0= IF DROP FALSE EXIT THEN
-  DUP @ SWAP 8 + = ;
-
-\ --- SEE / HELP / LOCATE (stub; ITC decompiler removed) ---------------------
-\ Prints : or CODE tag from STC-COLON?, help or name, optional VIEW leaf:line,
-\ then (primitive). Full STC disassembly is a later pass.
+\ --- SEE / HELP / LOCATE (STC Forth decompiler) -----------------------------
+\ Colon bodies: CFA points at native code (typically xt+8). Decode adrp/add/blr,
+\ lit, strings, and simple IF/ELSE/THEN. End bound = next word's HFA (or HERE).
 
 VARIABLE VIEW-LEAF-A
 VARIABLE VIEW-LEAF-U
@@ -279,16 +274,323 @@ DOC" (SEE-WHERE) ( xt -- ) print leaf:line when VIEW known"
 
 DOC" (SEE-HDR) ( xt -- xt ) print :/CODE tag and help or name"
 : (SEE-HDR) ( xt -- xt )
-    DUP STC-COLON? IF
+    DUP XT? IF DUP @ OVER 8 + = ELSE FALSE THEN IF
         58 EMIT SPACE
     ELSE 67 EMIT 79 EMIT 68 EMIT 69 EMIT SPACE THEN
     DUP >HELP COUNT DUP IF TYPE ELSE 2DROP DUP NAME>STRING TYPE THEN CR ;
 
-DOC" SEE ( 'name' -- ) show help/tag; body listed as (primitive)"
-: SEE ( "name" -- )
-    ' (SEE-HDR) DUP (SEE-WHERE) DROP
-    40 EMIT 112 EMIT 114 EMIT 105 EMIT 109 EMIT
-    105 EMIT 116 EMIT 105 EMIT 118 EMIT 101 EMIT 41 EMIT CR ;
+\ --- Body end: nearest later HFA across all registered wordlists ------------
+\ WORDLISTS exposes the registry (FORTH + VOCABULARY wids). Exclusive end =
+\ minimum HFA strictly above this word's code start, else HERE.
+VARIABLE (SEE-CODE0)
+VARIABLE (SEE-END-A)
+DOC" (SEE-NEAR) ( nt -- flag ) if HFA is after code0 and closer than end, keep it"
+: (SEE-NEAR)
+    {: nt | h -- :}
+    nt HFA TO h
+    (SEE-CODE0) @ h U<
+    h (SEE-END-A) @ U< AND IF h (SEE-END-A) ! THEN
+    TRUE ;
+DOC" (SEE-END) ( xt -- addr ) exclusive end = nearest later HFA, else HERE"
+: (SEE-END)
+    {: xt -- :}
+    HERE (SEE-END-A) !
+    xt @ (SEE-CODE0) !
+    ['] (SEE-NEAR) FORTH-WORDLIST TRAVERSE-WORDLIST
+    WORDLISTS 0 ?DO
+        DUP I CELLS + @
+        DUP FORTH-WORDLIST = IF DROP
+        ELSE ['] (SEE-NEAR) SWAP TRAVERSE-WORDLIST THEN
+    LOOP DROP
+    (SEE-END-A) @ ;
+
+\ --- Branch target map (addr,kind); kind 1=THEN 2=skip ---------------------
+32 CONSTANT (SEE-TMAX)
+CREATE (SEE-TADDR) (SEE-TMAX) CELLS ALLOT
+CREATE (SEE-TKIND) (SEE-TMAX) CELLS ALLOT
+VARIABLE (SEE-T#)
+VARIABLE (SEE-SKIP-CBZ)   \ after LOOP-RT, swallow following back-cbz
+
+DOC" (SEE-TCLR) ( -- ) clear branch target map"
+: (SEE-TCLR)  0 (SEE-T#) !  FALSE (SEE-SKIP-CBZ) ! ;
+DOC" (SEE-TREC) ( addr kind -- ) record branch target"
+: (SEE-TREC)
+    (SEE-T#) @ (SEE-TMAX) < IF
+        (SEE-T#) @ CELLS (SEE-TKIND) + !
+        (SEE-T#) @ CELLS (SEE-TADDR) + !
+        1 (SEE-T#) +!
+    ELSE 2DROP THEN ;
+DOC" (SEE-TFIND) ( addr -- kind|0 ) lookup and clear slot"
+: (SEE-TFIND)
+    {: a | i k -- :}
+    0 TO i  0 TO k
+    BEGIN i (SEE-T#) @ < WHILE
+        (SEE-TADDR) i CELLS + @ a = IF
+            (SEE-TKIND) i CELLS + @ TO k
+            0 (SEE-TADDR) i CELLS + !
+            k EXIT
+        THEN
+        i 1+ TO i
+    REPEAT
+    k ;
+
+DOC" (SEE-TCLR1) ( addr -- ) drop any recorded target at addr (no print)"
+: (SEE-TCLR1)  (SEE-TFIND) DROP ;
+
+DOC" (SEE-IND) ( -- ) print two-space indent (after CR before a conditional)"
+: (SEE-IND)  SPACE SPACE ;
+
+\ True after a token on the current line; CF only CRs when mid-line (no blank first line).
+VARIABLE (SEE-NEED-CR)
+
+DOC" (SEE-TOK) ( c-addr u -- ) type token + space (horizontal body)"
+: (SEE-TOK)  TYPE SPACE  TRUE (SEE-NEED-CR) ! ;
+
+DOC" (SEE-CF.) ( c-addr u -- ) CR if mid-line, indent, type conditional + space"
+: (SEE-CF.)
+    (SEE-NEED-CR) @ IF CR THEN
+    (SEE-IND) TYPE SPACE
+    TRUE (SEE-NEED-CR) ! ;
+
+\ --- Insn predicates / decoders (decimal; kernel _number is decimal-only) --
+\ Values = ARM64 encodings (hex in comments). Recompute with: HEX <enc> DECIMAL .
+\ str x30,[x23,#-8]!          F81F8EFE
+4162817790 CONSTANT (SEE-PROLOG)
+\ ldr x30,[x23],#8            F84086FE
+4164978430 CONSTANT (SEE-EPI-LDR)
+\ ret                         D65F03C0
+3596551104 CONSTANT (SEE-RET)
+\ ldr x0,[x22],#8             F84086C0
+4164978368 CONSTANT (SEE-DPOP0)
+\ str x0,[x22,#-8]!           F81F8EC0
+4162817728 CONSTANT (SEE-DPUSH0)
+\ blr x16                     D63F0200
+3594453504 CONSTANT (SEE-BLR16)
+\ adrp x16: (insn AND 9F00001F) = 90000010
+2415919120 CONSTANT (SEE-ADRP16M)
+2667577375 CONSTANT (SEE-ADRP16A)
+\ add x16,x16,#imm: (insn AND FFC003FF) = 91000210
+2432696848 CONSTANT (SEE-ADD16M)
+4290774015 CONSTANT (SEE-ADD16A)
+\ movz x0,#imm: (insn AND FFE0001F) = D2800000
+3531603968 CONSTANT (SEE-MOVZ0)
+\ movk x0 markers (documentation / future; lit decode uses shifts)
+4070572032 CONSTANT (SEE-MOVK16)
+4072669184 CONSTANT (SEE-MOVK32)
+4074766336 CONSTANT (SEE-MOVK48)
+4292870175 CONSTANT (SEE-MOVMSK)
+\ cbz/cbnz x0 / b
+3019898880 CONSTANT (SEE-CBZ0)
+3036676096 CONSTANT (SEE-CBNZ0)
+4278190111 CONSTANT (SEE-CBMSK)
+335544320 CONSTANT (SEE-B)
+4227858432 CONSTANT (SEE-BMSK)
+
+DOC" (SEE-ADRP?) ( insn -- flag )"
+: (SEE-ADRP?)  (SEE-ADRP16A) AND (SEE-ADRP16M) = ;
+DOC" (SEE-ADD16?) ( insn -- flag )"
+: (SEE-ADD16?)  (SEE-ADD16A) AND (SEE-ADD16M) = ;
+DOC" (SEE-SEX21) ( u21 -- n ) sign-extend 21-bit page imm"
+: (SEE-SEX21)
+    DUP 1048576 AND IF  -2097152 OR  ELSE  2097151 AND  THEN ;
+DOC" (SEE-ADRP-TARGET) ( ip -- tgt ) decode adrp x16; add x16 at ip"
+: (SEE-ADRP-TARGET)
+    {: ip | insn imm page -- :}
+    ip L@ TO insn
+    insn 29 RSHIFT 3 AND
+    insn 5 RSHIFT 524287 AND 2 LSHIFT OR (SEE-SEX21) TO imm
+    ip 4095 INVERT AND  imm 12 LSHIFT + TO page
+    ip 4 + L@ 10 RSHIFT 4095 AND  page + ;
+
+DOC" (SEE-MOV-IMM) ( ip -- x ) assemble movz/movk x0 cluster at ip"
+: (SEE-MOV-IMM)
+    {: ip | x -- :}
+    ip L@ 5 RSHIFT 65535 AND TO x
+    ip 4 + L@ 5 RSHIFT 65535 AND 16 LSHIFT x OR TO x
+    ip 8 + L@ 5 RSHIFT 65535 AND 32 LSHIFT x OR TO x
+    ip 12 + L@ 5 RSHIFT 65535 AND 48 LSHIFT x OR TO x
+    x ;
+
+DOC" (SEE-BR-TGT) ( ip insn -- tgt ) B or CBZ/CBNZ target (imm in insns ×4)"
+: (SEE-BR-TGT)
+    {: ip insn | off -- :}
+    insn (SEE-BMSK) AND (SEE-B) = IF
+        insn 67108863 AND DUP 33554432 AND IF 67108864 - THEN TO off
+    ELSE
+        insn 5 RSHIFT 524287 AND DUP 262144 AND IF 524288 - THEN TO off
+    THEN
+    ip off 4 * + ;
+
+DOC" (SEE-HEX.) ( u -- ) print 8 hex digits"
+: (SEE-HEX.)
+    BASE @ >R HEX 0 <# # # # # # # # # #> TYPE R> BASE ! ;
+
+DOC" (SEE-NAME.) ( xt -- ) name + space (horizontal)"
+: (SEE-NAME.)  NAME>STRING (SEE-TOK) ;
+
+DOC" (SEE-XT.) ( x -- ) if x is an xt print its name, else lit x"
+: (SEE-XT.)
+    DUP XT? IF (SEE-NAME.) ELSE S" lit" (SEE-TOK) . THEN ;
+
+DOC" (SEE-ALIGN8) ( addr -- addr' )"
+: (SEE-ALIGN8)  7 + 7 INVERT AND ;
+
+\ mov xt + blr _stc_create_xt (VARIABLE / CONSTANT / DOES> child)
+DOC" (SEE-AT-CREATE?) ( ip -- flag ) movz cluster at ip followed by create-xt call"
+: (SEE-AT-CREATE?)
+    {: ip -- :}
+    ip 16 + L@ (SEE-ADRP?) 0= IF FALSE EXIT THEN
+    ip 20 + L@ (SEE-ADD16?) 0= IF FALSE EXIT THEN
+    ip 24 + L@ (SEE-BLR16) = 0= IF FALSE EXIT THEN
+    ip 16 + (SEE-ADRP-TARGET) CREATE-XT-ADDR = ;
+
+DOC" (SEE-CREATE-XT) ( ip -- ip' ) mov xt + create-xt → name (imm is xt, not code)"
+: (SEE-CREATE-XT)
+    DUP (SEE-MOV-IMM) (SEE-XT.)
+    28 + ;
+
+\ --- Call / string / lit / branch steps ------------------------------------
+DOC" (SEE-SLIT) ( ip -- ip' ) after blr _stc_slit: print S-quote string"
+: (SEE-SLIT)
+    {: ip | u -- :}
+    ip @ TO u
+    83 EMIT 34 EMIT SPACE
+    ip 8 + u TYPE  34 EMIT SPACE
+    ip 8 + u + (SEE-ALIGN8) ;
+
+DOC" (SEE-CSTR) ( ip -- ip' ) after blr _stc_cstr"
+: (SEE-CSTR)
+    {: ip | u -- :}
+    ip C@ TO u
+    67 EMIT 34 EMIT SPACE
+    ip 1+ u TYPE  34 EMIT SPACE
+    ip u + 1+ (SEE-ALIGN8) ;
+
+DOC" (SEE-CALL) ( ip -- ip' ) adrp/add/blr at ip"
+: (SEE-CALL)
+    {: ip | tgt xt -- :}
+    ip (SEE-ADRP-TARGET) TO tgt
+    tgt SLIT-ADDR = IF  ip 12 + (SEE-SLIT) EXIT  THEN
+    tgt CSTR-ADDR = IF  ip 12 + (SEE-CSTR) EXIT  THEN
+    tgt DO-RT-ADDR = IF  S" DO" (SEE-CF.) ip 12 + EXIT  THEN
+    tgt QDO-RT-ADDR = IF  S" ?DO" (SEE-CF.) ip 12 + EXIT  THEN
+    tgt LOOP-RT-ADDR = IF
+        S" LOOP" (SEE-CF.) TRUE (SEE-SKIP-CBZ) !
+        ip 12 + EXIT THEN
+    tgt PLOOP-RT-ADDR = IF
+        S" +LOOP" (SEE-CF.) TRUE (SEE-SKIP-CBZ) !
+        ip 12 + EXIT THEN
+    tgt DOES-RT-ADDR = IF  S" DOES>" (SEE-CF.) ip 12 + EXIT  THEN
+    tgt FRAME-EXIT-ADDR = IF  ip 12 + EXIT  THEN
+    \ create-xt alone (mov already consumed) or lookback if entered at adrp
+    tgt CREATE-XT-ADDR = IF
+        ip 16 - DUP L@ (SEE-MOVMSK) AND (SEE-MOVZ0) = IF
+            (SEE-MOV-IMM) (SEE-XT.)
+        ELSE DROP S" (create)" (SEE-TOK) THEN
+        ip 12 + EXIT THEN
+    tgt CODE>XT TO xt
+    xt IF xt (SEE-NAME.) ELSE S" (???)" (SEE-TOK) THEN
+    ip 12 + ;
+
+DOC" (SEE-AT-LABEL) ( ip -- ) print THEN if ip is a recorded target"
+: (SEE-AT-LABEL)
+    (SEE-TFIND) 1 = IF S" THEN" (SEE-CF.) THEN ;
+
+VARIABLE (SEE-DONE)   \ set when epilogue seen
+
+DOC" (SEE-STEP) ( ip -- ip' ) decompile one pattern; epilogue prints ;"
+: (SEE-STEP)
+    {: ip | insn tgt -- :}
+    ip L@ TO insn
+    \ 1. colon epilogue: mid-body EXIT vs final ;
+    \ EXIT and ; both plant ldr x30 / ret; only stop when nothing remains to end.
+    insn (SEE-EPI-LDR) = IF
+        ip 4 + L@ (SEE-RET) = IF
+            ip 8 + (SEE-END-A) @ U< IF
+                S" EXIT" (SEE-TOK)
+            ELSE
+                59 EMIT CR
+                FALSE (SEE-NEED-CR) !
+                TRUE (SEE-DONE) !
+            THEN
+            ip 8 + EXIT THEN THEN
+    \ 2. adrp/add/blr x16
+    insn (SEE-ADRP?) IF
+        ip 4 + L@ (SEE-ADD16?) IF
+            ip 8 + L@ (SEE-BLR16) = IF
+                ip (SEE-CALL) EXIT THEN THEN THEN
+    \ 3. movz/movk×4: lit ( + DPUSH) or VARIABLE/CONSTANT/DOES> ( + create-xt)
+    insn (SEE-MOVMSK) AND (SEE-MOVZ0) = IF
+        ip 16 + L@ (SEE-DPUSH0) = IF
+            S" lit" (SEE-TOK) ip (SEE-MOV-IMM) .
+            ip 20 + EXIT THEN
+        ip (SEE-AT-CREATE?) IF
+            ip (SEE-CREATE-XT) EXIT THEN THEN
+    \ 4. DPOP + CBZ → IF (forward) or UNTIL (back)
+    insn (SEE-DPOP0) = IF
+        ip 4 + L@ DUP TO insn
+        insn (SEE-CBMSK) AND (SEE-CBZ0) = IF
+            ip 4 + insn (SEE-BR-TGT) TO tgt
+            ip tgt U< IF
+                S" IF" (SEE-CF.)
+                tgt 1 (SEE-TREC)
+            ELSE
+                S" UNTIL" (SEE-CF.)
+            THEN
+            ip 8 + EXIT THEN THEN
+    \ 5. CBZ alone (UNTIL / LOOP continue / IF without DPOP)
+    insn (SEE-CBMSK) AND (SEE-CBZ0) = IF
+        (SEE-SKIP-CBZ) @ IF
+            FALSE (SEE-SKIP-CBZ) !
+            ip 4 + EXIT THEN
+        ip insn (SEE-BR-TGT) TO tgt
+        tgt ip U< IF
+            S" UNTIL" (SEE-CF.)
+        ELSE
+            S" IF" (SEE-CF.)
+            tgt 1 (SEE-TREC)
+        THEN
+        ip 4 + EXIT THEN
+    \ 6. B
+    insn (SEE-BMSK) AND (SEE-B) = IF
+        ip insn (SEE-BR-TGT) TO tgt
+        tgt ip U< IF
+            S" AGAIN" (SEE-CF.)
+        ELSE
+            \ IF's cbz lands on the insn after this B; drop that THEN marker
+            ip 4 + (SEE-TCLR1)
+            S" ELSE" (SEE-CF.)
+            tgt 1 (SEE-TREC)
+        THEN
+        ip 4 + EXIT THEN
+    \ 7. CBNZ (?DO skip) — quiet
+    insn (SEE-CBMSK) AND (SEE-CBNZ0) = IF  ip 4 + EXIT THEN
+    \ 8. unknown
+    S" hex:" TYPE insn (SEE-HEX.) SPACE
+    ip 4 + ;
+
+DOC" (SEE-BODY) ( xt -- ) decompile STC colon body through ;"
+: (SEE-BODY)
+    {: xt | ip end -- :}
+    (SEE-TCLR)  FALSE (SEE-DONE) !  FALSE (SEE-NEED-CR) !
+    xt @ TO ip
+    xt (SEE-END) TO end
+    end ip U< IF HERE TO end THEN
+    ip L@ (SEE-PROLOG) = IF ip 4 + TO ip THEN
+    BEGIN
+        (SEE-DONE) @ 0=  ip end U< AND
+    WHILE
+        ip (SEE-AT-LABEL)
+        ip (SEE-STEP) TO ip
+    REPEAT
+    (SEE-DONE) @ 0= IF CR THEN ;
+
+DOC" SEE ( 'name' -- ) header + STC body decompile (or (code))"
+: SEE
+    ' (SEE-HDR) DUP (SEE-WHERE)
+    DUP XT? 0= IF DROP S" (code)" TYPE CR EXIT THEN
+    DUP @ OVER 8 + = IF (SEE-BODY)
+    ELSE DROP S" (code)" TYPE CR THEN ;
 
 DOC" LOCATE ( 'name' -- ) print source leaf:line"
 : LOCATE
@@ -296,6 +598,124 @@ DOC" LOCATE ( 'name' -- ) print source leaf:line"
 
 DOC" HELP ( 'name' -- ) synonym of SEE"
 : HELP  SEE ;
+
+\ --- SYSVOC: hide SEE / support helpers from FORTH (64Forth vocsys) ---------
+DOC" VOC-WID ( vocab-xt -- wid ) body of a VOCABULARY child"
+: VOC-WID  2 CELLS + ;
+
+DOC" (WL-UNLINK#) ( xt wid -- thread ) unlink xt from wid; -1 if missing"
+: (WL-UNLINK#)
+    {: xt wid | slot pred -- :}
+    DICT-THREADS 0 DO
+        wid I CELLS + TO slot
+        BEGIN slot @ DUP TO pred WHILE
+            pred xt = IF
+                pred >LINK @ slot !
+                I UNLOOP EXIT
+            THEN
+            pred >LINK TO slot
+        REPEAT DROP
+    LOOP
+    -1 ;
+
+DOC" (WL-LINK#) ( xt wid thread -- ) link xt onto wid thread"
+: (WL-LINK#)
+    {: xt wid th | head -- :}
+    th 0< IF S" XT>WL: not in source wid" TYPE CR ABORT THEN
+    wid th CELLS + TO head
+    head @ xt >LINK !
+    xt head ! ;
+
+DOC" XT>WL-FROM ( xt from-wid to-wid -- ) move xt between wordlists"
+: XT>WL-FROM
+    {: xt from to -- :}
+    xt from (WL-UNLINK#)
+    xt to ROT (WL-LINK#) ;
+
+DOC" XT>WL ( xt to-wid -- ) move xt from FORTH-WORDLIST"
+: XT>WL
+    {: xt to -- :}
+    xt FORTH-WORDLIST to XT>WL-FROM ;
+
+DOC" FORTH>WL ( c-addr u wid -- ) move named FORTH word to wid (no-op if missing)"
+: FORTH>WL
+    >R 2DUP FORTH-WORDLIST SEARCH-WORDLIST
+    DUP 0= IF DROP 2DROP R> DROP EXIT THEN
+    DROP >R 2DROP R> R> XT>WL ;
+
+DOC" FORTH>VOC ( c-addr u vocab-xt -- ) move named FORTH word into vocabulary"
+: FORTH>VOC  VOC-WID FORTH>WL ;
+
+DOC" SYSVOC ( -- ) vocabulary for system / support words; execute to ALSO it"
+VOCABULARY SYSVOC
+
+DOC" FORTH>SYSVOC ( c-addr u -- ) move named FORTH word into SYSVOC"
+: FORTH>SYSVOC  ['] SYSVOC FORTH>VOC ;
+
+\ Rechain SEE internals (compiled calls keep working; WORDS stays clean)
+S" VIEW-LEAF-A" FORTH>SYSVOC
+S" VIEW-LEAF-U" FORTH>SYSVOC
+S" (VIEW-BASENAME)" FORTH>SYSVOC
+S" (SEE-WHERE)" FORTH>SYSVOC
+S" (SEE-HDR)" FORTH>SYSVOC
+S" (SEE-CODE0)" FORTH>SYSVOC
+S" (SEE-END-A)" FORTH>SYSVOC
+S" (SEE-NEAR)" FORTH>SYSVOC
+S" (SEE-END)" FORTH>SYSVOC
+S" (SEE-TMAX)" FORTH>SYSVOC
+S" (SEE-TADDR)" FORTH>SYSVOC
+S" (SEE-TKIND)" FORTH>SYSVOC
+S" (SEE-T#)" FORTH>SYSVOC
+S" (SEE-SKIP-CBZ)" FORTH>SYSVOC
+S" (SEE-TCLR)" FORTH>SYSVOC
+S" (SEE-TREC)" FORTH>SYSVOC
+S" (SEE-TFIND)" FORTH>SYSVOC
+S" (SEE-TCLR1)" FORTH>SYSVOC
+S" (SEE-IND)" FORTH>SYSVOC
+S" (SEE-NEED-CR)" FORTH>SYSVOC
+S" (SEE-TOK)" FORTH>SYSVOC
+S" (SEE-CF.)" FORTH>SYSVOC
+S" (SEE-PROLOG)" FORTH>SYSVOC
+S" (SEE-EPI-LDR)" FORTH>SYSVOC
+S" (SEE-RET)" FORTH>SYSVOC
+S" (SEE-DPOP0)" FORTH>SYSVOC
+S" (SEE-DPUSH0)" FORTH>SYSVOC
+S" (SEE-BLR16)" FORTH>SYSVOC
+S" (SEE-ADRP16M)" FORTH>SYSVOC
+S" (SEE-ADRP16A)" FORTH>SYSVOC
+S" (SEE-ADD16M)" FORTH>SYSVOC
+S" (SEE-ADD16A)" FORTH>SYSVOC
+S" (SEE-MOVZ0)" FORTH>SYSVOC
+S" (SEE-MOVK16)" FORTH>SYSVOC
+S" (SEE-MOVK32)" FORTH>SYSVOC
+S" (SEE-MOVK48)" FORTH>SYSVOC
+S" (SEE-MOVMSK)" FORTH>SYSVOC
+S" (SEE-CBZ0)" FORTH>SYSVOC
+S" (SEE-CBNZ0)" FORTH>SYSVOC
+S" (SEE-CBMSK)" FORTH>SYSVOC
+S" (SEE-B)" FORTH>SYSVOC
+S" (SEE-BMSK)" FORTH>SYSVOC
+S" (SEE-ADRP?)" FORTH>SYSVOC
+S" (SEE-ADD16?)" FORTH>SYSVOC
+S" (SEE-SEX21)" FORTH>SYSVOC
+S" (SEE-ADRP-TARGET)" FORTH>SYSVOC
+S" (SEE-MOV-IMM)" FORTH>SYSVOC
+S" (SEE-BR-TGT)" FORTH>SYSVOC
+S" (SEE-HEX.)" FORTH>SYSVOC
+S" (SEE-NAME.)" FORTH>SYSVOC
+S" (SEE-XT.)" FORTH>SYSVOC
+S" (SEE-ALIGN8)" FORTH>SYSVOC
+S" (SEE-AT-CREATE?)" FORTH>SYSVOC
+S" (SEE-CREATE-XT)" FORTH>SYSVOC
+S" (SEE-SLIT)" FORTH>SYSVOC
+S" (SEE-CSTR)" FORTH>SYSVOC
+S" (SEE-CALL)" FORTH>SYSVOC
+S" (SEE-AT-LABEL)" FORTH>SYSVOC
+S" (SEE-DONE)" FORTH>SYSVOC
+S" (SEE-STEP)" FORTH>SYSVOC
+S" (SEE-BODY)" FORTH>SYSVOC
+
+ONLY FORTH DEFINITIONS
 
 \ --- Timing (MS@ / MS are CODE; ELAPSED prints HH:MM:SS.mmm) -----------------
 DOC" .2DIG ( n -- ) print n as 2 decimal digits"

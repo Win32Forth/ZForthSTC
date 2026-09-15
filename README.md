@@ -1,17 +1,15 @@
-# ZForth
+# ZForthSTC
 
-**ZForth** is a macOS SwiftUI host and a small ARM64 Forth kernel.
+**ZForthSTC** is a macOS SwiftUI host and an ARM64 **subroutine-threaded (STC)** Forth kernel.
 
-ZForth was started as a console + editor application that embeds the **16Forth** kernel lineage (native ARM64 assembly + high-level Forth). The name ZForth is one of Tom Zimmer's Forths created with the assistance of Grok, and Grok Build.
+It continues Tom Zimmer’s ZForth / 16Forth lineage with Grok Build assistance. Colon definitions compile to native ARM64 (`blr` / `ret`); the old ITC / `NEXT` path is gone.
 
-**Current version:** 0.7  
-**Console / kernel banner:** `16Forth 0.7 ready === Sep 12, 2026 10:02 AM ===`
+**Current version:** 0.8  
+**Console / kernel banner:** `ZForthSTC 0.8 ready === Sep 14, 2026 8:21 PM ===`
 
-Stamp the date/time only when finishing a change set for a version (same policy as 64Forth). Edit the `banner` string in `ZForth/Kernel/kernel.s`.
+Stamp the date/time only when finishing a change set for a version (same policy as 64Forth). Edit the `banner` string in `ZForthSTC/Kernel/kernel.s`.
 
-Repository: [github.com/Win32Forth/ZForth](https://github.com/Win32Forth/ZForth)
-
-**macOS disk image:** `ZForth/Releases/ZForth-0.7.0-macOS.dmg` (also attached to the [v0.7.0](https://github.com/Win32Forth/ZForth/releases/tag/v0.7.0) GitHub release).
+Repository: this project tree (`ZForthSTC.xcodeproj`).
 
 ---
 
@@ -19,9 +17,9 @@ Repository: [github.com/Win32Forth/ZForth](https://github.com/Win32Forth/ZForth)
 
 | Piece | Role |
 | --- | --- |
-| **ZForth.app** (SwiftUI) | Forth Console window and Editor / Debugger window |
+| **ZForthSTC.app** (SwiftUI) | Forth Console window and Editor / Debugger window |
 | **Host bridge** | C ABI (`zforth_*`) between Swift and the kernel |
-| **Kernel** | ARM64 assembly VM (`kernel.s`) + embedded `kernel.fth` / `ansfile.fth` |
+| **Kernel** | ARM64 STC (`kernel.s`) + embedded `kernel.fth` / `ansfile.fth` |
 | **Resources** | Bundled `AutoLoad/`, `Library/`, and `Docs/` |
 
 Open the Xcode project (`ZForthSTC.xcodeproj`) and run the **ZForthSTC** scheme on Apple Silicon macOS.
@@ -33,74 +31,79 @@ For scripts / CI / tooling without the GUI:
 ```bash
 ./tools/zforthstc-agent -e '1 2 + .'
 ./tools/zforthstc-agent -e ': 1+ 1 + ; 5 1+ .'
+./tools/zforthstc-agent --repl < session.txt
 ```
 
-After boot blobs, new `:` definitions are STC by default (no need to type `STC`).
+After boot, `:` always compiles native (STC) code.
 
 See `ZForthSTC/Docs/Agent-channel.md`.
 
 ---
 
-## Progress notes (0.6 → 0.7 era)
-
-Work from project creation through version **0.7** (10–12 Sep 2026).
+## Progress notes
 
 ### 2026-09-10 — Project born
 
-- Initial Xcode / SwiftUI scaffold for the ZForth app.
+- Initial Xcode / SwiftUI scaffold (ZForth host).
 
 ### 2026-09-11 — Kernel hosted in the app
 
-- Wired the **16Forth** kernel into the macOS host: cold start, `kernel_eval`, and line input via `ACCEPT`.
+- Wired the kernel into the macOS host: cold start, `kernel_eval`, and line input via `ACCEPT`.
 - Console output from `EMIT` / host write paths appears in the Forth Console window.
 - Host ABI and glue: `zforth_host.h`, `KernelHostGlue.c`, `ForthCBridge.swift`, `ForthSession`.
-- Fixed file pathing for the bundled tree; checked in **Resources** folders:
-  - `Resources/AutoLoad/` (including `autoload.fth`)
-  - `Resources/Library/` (smoke loaders)
-  - `Resources/Docs/`
-- File menu work: Open / Save / **Save As**, correct extensions, and keeping a live reference to the opened editor file so Save writes back to the same path.
-- **Dirty detection** for the editor: prompt to save / don’t save / cancel on open, close, and quit.
+- Bundled **Resources**: `AutoLoad/`, `Library/`, `Docs/`.
+- File menu: Open / Save / **Save As**, dirty detection for the editor.
 
 ### 2026-09-12 — EDIT and unified console
 
-- Added Forth word **`EDIT`**: open a path (or bare name) in the Editor / Debugger window via `zforth_edit_hook`.
-- Dirty check on `EDIT` so unsaved editor content is not silently discarded.
-- Editor window launch behavior set to **suppressed** so it does not appear at app startup (only when opened from the menu or `EDIT`).
-- **Unified console input**: removed the separate command line at the bottom. Commands are typed in the same window as output, with normal editing and paste of the input tail before Return submits the line.
+- Forth word **`EDIT`**; suppressed editor window at launch.
+- Unified console input (no separate command line).
+- Version **0.7** banner era (pre-STC fork naming).
 
-### Version 0.7
+### 2026-09-13…14 — STC migration (toward 0.8)
 
-- Startup banner bumped from `16Forth 0.6 ready` to **`16Forth 0.7 ready`**, with a 64Forth-style date/time stamp:  
-  `16Forth 0.7 ready === Sep 12, 2026 10:02 AM ===`
-- This README added to capture the above progress.
+- MAP_JIT dictionary; colon bodies as native ARM64; interpret via `blr` / `ret`.
+- Control flow, `CREATE`/`DOES>`, `S"`/`C"`, File-Access, `EXECUTE` under STC.
+- ITC / `NEXT` / threaded `LIT`/`BRANCH`/`0BRANCH` removed.
+
+### Version 0.8
+
+- Startup banner: **`ZForthSTC 0.8 ready === Sep 14, 2026 8:21 PM ===`**
+- ANS locals (64Forth-adapted for STC): `{: … :}`, `LOCALS|`, `TO`, frame exit on `;`/`EXIT`.
+- Forth **`SEE` / `HELP` / `LOCATE`**: STC decompiler (calls→names, lit, strings, `IF`/`ELSE`/`THEN`, mid-body `EXIT` vs `;`).
+- Body end = nearest later HFA across `WORDLISTS`; `CODE>XT` walks all registered wordlists.
+- **`SYSVOC`** + `FORTH>SYSVOC` / `FORTH>VOC` (64Forth vocsys style) to hide SEE helpers.
+- Docs and product naming aligned on **ZForthSTC** (was mixed 16Forth / 16ForthSTC).
 
 ---
 
 ## Layout
 
 ```
-ZForth/
+ZForthSTC/
   Console/          ConsoleView + editable ConsoleTextView
   Editor/           EditorView
-  Host/             ForthSession, C bridge, kernel glue
+  Host/             ForthSession, agent channel, C bridge, kernel glue
   Kernel/           kernel.s, kernel.fth, ansfile.fth, host_*.c
   Resources/        AutoLoad, Library, Docs (bundled)
+  Docs/             Agent-channel.md and related notes
   Support/          FileCommands, unsaved-changes, AppDelegate, …
-ZForth.xcodeproj/
+ZForthSTC.xcodeproj/
+tools/zforthstc-agent
 ```
 
 ---
 
-## Notable Forth / host features so far
+## Notable Forth / host features
 
 - Interactive REPL in the console (committed output + editable input tail).
 - Editor window with Open / Save / Save As and unsaved-change guards.
-- `EDIT` from the Forth side to load a file into the editor.
-- Working directory and library path helpers on the host session (`chdir`, `fromLib`, etc.).
-- Embedded high-level Forth and ANS-style file words loaded at cold start.
+- `EDIT` from the Forth side; headless **agent channel** for automation.
+- Native STC colon compile; ANS File-Access words at cold start.
+- ANS locals; intelligent `SEE` over STC bodies; `SYSVOC` for support words.
 
 ---
 
 ## Lineage
 
-ZForth continues the YAFOTW thread after earlier experiments (e.g. 16Forth / 16ForthCLI, PickleForth, TZForth). The kernel still identifies as **16Forth** in the sign-on banner; the **app and repo** are named **ZForth**.
+ZForthSTC continues the YAFOTW thread after earlier experiments (16Forth / 16ForthCLI, PickleForth, TZForth, ZForth). The sign-on banner and app identify as **ZForthSTC**.
