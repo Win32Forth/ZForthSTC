@@ -8,8 +8,11 @@
 
 static volatile int g_running = 0;
 
-static char *g_load_buf = NULL;
-static size_t g_load_len = 0;
+/* Nested INCLUDE/REQUIRE must keep parent buffers alive. free_load_buf() used
+ * to free the only buffer on each new load (use-after-free on the parent). */
+#define LOAD_STACK_MAX 8
+static char *g_load_stack[LOAD_STACK_MAX];
+static int g_load_sp = 0;
 
 static void host_emit(int c)
 {
@@ -21,12 +24,23 @@ static void host_emit_buf(const char *buf, size_t n)
     zforth_type(buf, n);
 }
 
-static void free_load_buf(void)
+static void free_load_stack(void)
 {
-    char *p = g_load_buf;
-    g_load_buf = NULL;
-    g_load_len = 0;
-    free(p);
+    while (g_load_sp > 0) {
+        g_load_sp--;
+        free(g_load_stack[g_load_sp]);
+        g_load_stack[g_load_sp] = NULL;
+    }
+}
+
+/* Kernel calls this when an INCLUDE/REQUIRE SOURCE ends (SRCID_HOST). */
+static void host_end_include(void)
+{
+    if (g_load_sp <= 0)
+        return;
+    g_load_sp--;
+    free(g_load_stack[g_load_sp]);
+    g_load_stack[g_load_sp] = NULL;
 }
 
 static int host_load_file(const char *path, size_t path_len,
@@ -35,9 +49,11 @@ static int host_load_file(const char *path, size_t path_len,
     char pathz[1024];
     char filebuf[1 << 16];
     int32_t nread;
+    char *buf;
 
-    free_load_buf();
-    
+    if (g_load_sp >= LOAD_STACK_MAX)
+        return -1;
+
     if (path_len == 0) {
         int32_t plen = zforth_open_panel(pathz, (int32_t)sizeof(pathz) - 1);
         if (plen <= 0) return -1;
@@ -60,21 +76,17 @@ static int host_load_file(const char *path, size_t path_len,
             snprintf(pathz, sizeof(pathz), "%s/%s", base, rel);
         }
     }
-    
-//    zforth_type("load: ", 6);
-//    zforth_type(pathz, strlen(pathz));
-//    zforth_cr();
 
     nread = zforth_load_file(pathz, filebuf, (int32_t)sizeof(filebuf));
     if (nread < 0) return -1;
 
-    g_load_buf = malloc((size_t)nread);
-    if (!g_load_buf) return -1;
-    memcpy(g_load_buf, filebuf, (size_t)nread);
-    g_load_len = (size_t)nread;
+    buf = malloc((size_t)nread);
+    if (!buf) return -1;
+    memcpy(buf, filebuf, (size_t)nread);
+    g_load_stack[g_load_sp++] = buf;
 
-    *out_ptr = g_load_buf;
-    *out_len = g_load_len;
+    *out_ptr = buf;
+    *out_len = (size_t)nread;
     return 0;
 }
 
@@ -89,11 +101,15 @@ void zforth_vm_start(void)
     kernel_set_emit(host_emit);
     kernel_set_emit_buf(host_emit_buf);
     kernel_set_load_file(host_load_file);
+    kernel_set_end_include(host_end_include);
     kernel_set_fromlib(zforth_fromlib_arm);
     kernel_set_fromlib_clear(zforth_fromlib_clear);
     kernel_set_chdir(zforth_chdir_hook);
     kernel_set_pwd(zforth_pwd_hook);
     kernel_set_dir(zforth_dir_hook);
+    kernel_set_bi_mul(zforth_bi_mul);
+    kernel_set_bi_divmod(zforth_bi_divmod);
+    kernel_set_bi_isqrt(zforth_bi_isqrt);
     kernel_cold_start();
 
     while (g_running) {
@@ -107,7 +123,7 @@ void zforth_vm_start(void)
         if (sn > 0) {
             kernel_eval(src, (size_t)sn);
             zforth_cr();
-            free_load_buf();
+            free_load_stack();
             continue;
         }
 
@@ -119,7 +135,7 @@ void zforth_vm_start(void)
             kernel_eval(line, (size_t)n);
             zforth_cr();
         }
-        free_load_buf();
+        free_load_stack();
     }
 }
 
@@ -135,11 +151,15 @@ static void agent_install_hooks(void)
     kernel_set_emit(host_emit);
     kernel_set_emit_buf(host_emit_buf);
     kernel_set_load_file(host_load_file);
+    kernel_set_end_include(host_end_include);
     kernel_set_fromlib(zforth_fromlib_arm);
     kernel_set_fromlib_clear(zforth_fromlib_clear);
     kernel_set_chdir(zforth_chdir_hook);
     kernel_set_pwd(zforth_pwd_hook);
     kernel_set_dir(zforth_dir_hook);
+    kernel_set_bi_mul(zforth_bi_mul);
+    kernel_set_bi_divmod(zforth_bi_divmod);
+    kernel_set_bi_isqrt(zforth_bi_isqrt);
 }
 
 int zforth_agent_start(void)
@@ -160,7 +180,7 @@ int zforth_agent_eval(const char *line, size_t n)
     if (!line)
         return -1;
     st = kernel_eval(line, n);
-    free_load_buf();
+    free_load_stack();
     return st;
 }
 

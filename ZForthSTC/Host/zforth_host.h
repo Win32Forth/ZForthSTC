@@ -25,6 +25,11 @@ void zforth_edit_hook(const char *path, size_t n);
 void zforth_fromlib_arm(void);
 void zforth_fromlib_clear(void);
 void zforth_request_quit(void);
+
+/* BIG-INTEGER host (pointers are ALLOCATE'd BI blocks). */
+void zforth_bi_mul(int64_t a, int64_t b, int64_t r);
+void zforth_bi_divmod(int64_t num, int64_t den, int64_t quot, int64_t rem);
+void zforth_bi_isqrt(int64_t a, int64_t r);
 int32_t zforth_get_load_base(char *out, int32_t maxcount);
 
 int32_t zforth_accept(char *addr, int32_t maxcount);

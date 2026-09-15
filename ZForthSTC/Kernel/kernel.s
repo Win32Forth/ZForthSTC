@@ -210,6 +210,14 @@ pwd_hook:           .quad 0
 dir_hook:           .quad 0
 emit_hook:          .quad 0      // void (*)(int c)
 emit_buf_hook:      .quad 0      // void (*)(const char *buf, size_t n)
+// BIG-INTEGER host (64Forth ABI; limb layout matches Library/BigInteger)
+bi_mul_hook:        .quad 0      // void (*)(int64 a, b, r)
+bi_divmod_hook:     .quad 0      // void (*)(int64 num, den, quot, rem)
+bi_isqrt_hook:      .quad 0      // void (*)(int64 a, r)
+host_tmp0:          .quad 0
+host_tmp1:          .quad 0
+host_tmp2:          .quad 0
+host_tmp3:          .quad 0
 view_file_n:        .quad 0
 view_src_id:        .quad 0            // current VIEW file-id (0=none)
 view_id_sp:         .quad 0
@@ -1372,6 +1380,14 @@ XZLT:
     ldr  x0, [x22]
     cmp  x0, #0
     csetm x0, lt
+    str  x0, [x22]
+    STC_TAIL
+
+BOOT_WORD "0>", "0> ( n -- f ) positive?", 0, XZGT, 0
+XZGT:
+    ldr  x0, [x22]
+    cmp  x0, #0
+    csetm x0, gt
     str  x0, [x22]
     STC_TAIL
 
@@ -3371,6 +3387,131 @@ XVIEW_STAMP:
     str  x0, [x1, #-8]
 1:  STC_TAIL
 
+// ============================================================================
+// Memory-Allocation + BIG-INTEGER host CODE (PI / BigInteger libraries)
+// Stack is memory-only (DPOP); end with STC_TAIL. Keep LR across bl/blr.
+// ============================================================================
+
+// ALLOCATE ( u -- a-addr ior )  libc malloc; ior 0 ok, -1 fail
+BOOT_WORD "ALLOCATE", "ALLOCATE ( u -- a-addr ior ) allocate u bytes", 0, XALLOCATE, 0
+XALLOCATE:
+    CODE_SAVE_LR
+    DPOP x0
+    cbnz x0, 1f
+    mov  x0, #1
+1:  SAVE_C_CALLEE
+    bl   _malloc
+    RESTORE_C_CALLEE
+    mov  x1, x0                    // a-addr
+    mov  x2, #0                    // ior
+    cbnz x1, 2f
+    mov  x2, #-1
+2:  DPUSH x1
+    DPUSH x2
+    CODE_RESTORE_LR
+    STC_TAIL
+
+// FREE ( a-addr -- ior )
+BOOT_WORD "FREE", "FREE ( a-addr -- ior ) free ALLOCATE block", 0, XFREE, 0
+XFREE:
+    CODE_SAVE_LR
+    DPOP x0
+    cbz  x0, 1f
+    SAVE_C_CALLEE
+    bl   _free
+    RESTORE_C_CALLEE
+1:  mov  x0, #0
+    DPUSH x0
+    CODE_RESTORE_LR
+    STC_TAIL
+
+// BI-MUL ( a b r -- )
+BOOT_WORD "BI-MUL", "BI-MUL ( a b r -- ) BIG-INTEGER host multiply", 0, XBIMUL, 0
+XBIMUL:
+    CODE_SAVE_LR
+    DPOP x2                        // r
+    DPOP x1                        // b
+    DPOP x0                        // a
+    adrp x3, host_tmp0@page
+    add  x3, x3, host_tmp0@pageoff
+    str  x0, [x3]
+    str  x1, [x3, #8]
+    str  x2, [x3, #16]
+    adrp x3, bi_mul_hook@page
+    add  x3, x3, bi_mul_hook@pageoff
+    ldr  x9, [x3]
+    cbz  x9, 1f
+    adrp x3, host_tmp0@page
+    add  x3, x3, host_tmp0@pageoff
+    ldr  x0, [x3]
+    ldr  x1, [x3, #8]
+    ldr  x2, [x3, #16]
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+1:  CODE_RESTORE_LR
+    STC_TAIL
+
+// BI-DIVMOD ( num den quot rem work -- )  work ignored
+BOOT_WORD "BI-DIVMOD", "BI-DIVMOD ( num den quot rem work -- ) BIG-INTEGER host divmod", 0, XBIDIVMOD, 0
+XBIDIVMOD:
+    CODE_SAVE_LR
+    DPOP x0                        // work (ignore)
+    DPOP x3                        // rem
+    DPOP x2                        // quot
+    DPOP x1                        // den
+    DPOP x0                        // num
+    adrp x4, host_tmp0@page
+    add  x4, x4, host_tmp0@pageoff
+    str  x0, [x4]
+    str  x1, [x4, #8]
+    str  x2, [x4, #16]
+    str  x3, [x4, #24]
+    adrp x0, bi_divmod_hook@page
+    add  x0, x0, bi_divmod_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, 1f
+    adrp x4, host_tmp0@page
+    add  x4, x4, host_tmp0@pageoff
+    ldr  x0, [x4]
+    ldr  x1, [x4, #8]
+    ldr  x2, [x4, #16]
+    ldr  x3, [x4, #24]
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+1:  CODE_RESTORE_LR
+    STC_TAIL
+
+// BI-ISQRT ( a r quot rem work t1 t2 -- )  scratch ignored
+BOOT_WORD "BI-ISQRT", "BI-ISQRT ( a r quot rem work t1 t2 -- ) BIG-INTEGER host isqrt", 0, XBIISQRT, 0
+XBIISQRT:
+    CODE_SAVE_LR
+    DPOP x0                        // t2
+    DPOP x0                        // t1
+    DPOP x0                        // work
+    DPOP x0                        // rem
+    DPOP x0                        // quot
+    DPOP x1                        // r
+    DPOP x0                        // a
+    adrp x2, host_tmp0@page
+    add  x2, x2, host_tmp0@pageoff
+    str  x0, [x2]
+    str  x1, [x2, #8]
+    adrp x0, bi_isqrt_hook@page
+    add  x0, x0, bi_isqrt_hook@pageoff
+    ldr  x9, [x0]
+    cbz  x9, 1f
+    adrp x2, host_tmp0@page
+    add  x2, x2, host_tmp0@pageoff
+    ldr  x0, [x2]
+    ldr  x1, [x2, #8]
+    SAVE_C_CALLEE
+    blr  x9
+    RESTORE_C_CALLEE
+1:  CODE_RESTORE_LR
+    STC_TAIL
+
 .section __DATA,__bootword,regular
 .quad 0, 0, 0, 0, 0
 // CREATE / DOES> runtimes (STC)
@@ -3639,6 +3780,27 @@ _kernel_set_pwd:
 _kernel_set_dir:
     adrp x1, dir_hook@page
     add  x1, x1, dir_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_bi_mul
+_kernel_set_bi_mul:
+    adrp x1, bi_mul_hook@page
+    add  x1, x1, bi_mul_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_bi_divmod
+_kernel_set_bi_divmod:
+    adrp x1, bi_divmod_hook@page
+    add  x1, x1, bi_divmod_hook@pageoff
+    str  x0, [x1]
+    ret
+
+.globl _kernel_set_bi_isqrt
+_kernel_set_bi_isqrt:
+    adrp x1, bi_isqrt_hook@page
+    add  x1, x1, bi_isqrt_hook@pageoff
     str  x0, [x1]
     ret
 
