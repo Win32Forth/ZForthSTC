@@ -215,9 +215,10 @@ DOC" ABORT-QUOTE ( flag -- ) if flag nonzero type message and ABORT (immediate)"
     POSTPONE IF POSTPONE S" POSTPONE TYPE POSTPONE CR
     POSTPONE ABORT POSTPONE THEN
   ELSE 34 PARSE ROT IF TYPE CR ABORT THEN 2DROP THEN ; IMMEDIATE
-DOC" (CONTEXT) ( -- wid ) first search-order wordlist, or FORTH"
+\ CONTEXT = search_order[0] = GET-ORDER wid1 (not widn). Empty order -> FORTH.
+DOC" (CONTEXT) ( -- wid ) first search-order wordlist (wid1), or FORTH"
 : (CONTEXT)  GET-ORDER ?DUP 0= IF FORTH-WORDLIST EXIT THEN
-  BEGIN DUP 1 > WHILE SWAP DROP 1- REPEAT DROP ;
+  1- 0 ?DO NIP LOOP ;
 
 DOC" (UPC) ( c -- c' ) uppercase ASCII letter"
 : (UPC)  DUP 97 < 0= OVER 122 > 0= AND IF 32 - THEN ;
@@ -750,7 +751,7 @@ DOC" .ELAPSED ( ms -- ) print ms as HH:MM:SS.mmm"
     58 EMIT R> .2DIG 58 EMIT R> .2DIG 46 EMIT R> .3DIG
     R> BASE ! ;
 DOC" ELAPSED ( 'name' -- ) run name once and print elapsed time"
-: ELAPSED  ( "name" -- )  ' MS@ >R EXECUTE MS@ R> - .ELAPSED CR ;
+: ELAPSED  ( "name" -- )  ' MS@ >R EXECUTE MS@ R> - CR .ELAPSED CR ;
 
 \ --- Flags for FILE-ECHO etc. -----------------------------------------------
 DOC" ON ( addr -- ) store true (-1) at addr"

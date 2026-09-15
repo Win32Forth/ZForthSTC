@@ -22,6 +22,12 @@ struct ConsoleTextView: NSViewRepresentable {
         tv.isRichText = false
         tv.importsGraphics = false
         tv.allowsUndo = true
+        // Forth needs ASCII ' and -; macOS smart quotes/dashes break TICK etc.
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+        tv.isAutomaticSpellingCorrectionEnabled = false
+        tv.isContinuousSpellCheckingEnabled = false
         tv.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
         tv.textColor = .labelColor
         tv.backgroundColor = .textBackgroundColor
